@@ -147,7 +147,75 @@ export default {
             "Thank you! Your review has been submitted and is awaiting moderation."
         });
       }
+// Admin: approve a review
+if (
+  url.pathname.startsWith("/api/admin/reviews/") &&
+  url.pathname.endsWith("/approve") &&
+  request.method === "POST"
+) {
+  const reviewId = Number(
+    url.pathname
+      .replace("/api/admin/reviews/", "")
+      .replace("/approve", "")
+  );
 
+  if (!Number.isInteger(reviewId) || reviewId < 1) {
+    return Response.json(
+      { error: "Invalid review ID." },
+      { status: 400 }
+    );
+  }
+
+  const review = await env.DB.prepare(`
+    SELECT restaurant_id
+    FROM reviews
+    WHERE id = ?
+    LIMIT 1
+  `).bind(reviewId).first();
+
+  if (!review) {
+    return Response.json(
+      { error: "Review not found." },
+      { status: 404 }
+    );
+  }
+
+  await env.DB.prepare(`
+    UPDATE reviews
+    SET status = 'approved'
+    WHERE id = ?
+  `).bind(reviewId).run();
+
+  await env.DB.prepare(`
+    UPDATE restaurants
+    SET
+      rating = COALESCE(
+        (
+          SELECT ROUND(AVG(overall_rating), 1)
+          FROM reviews
+          WHERE restaurant_id = ?
+          AND status = 'approved'
+        ),
+        0
+      ),
+      review_count = (
+        SELECT COUNT(*)
+        FROM reviews
+        WHERE restaurant_id = ?
+        AND status = 'approved'
+      )
+    WHERE id = ?
+  `).bind(
+    review.restaurant_id,
+    review.restaurant_id,
+    review.restaurant_id
+  ).run();
+
+  return Response.json({
+    success: true,
+    message: "Review approved and restaurant rating updated."
+  });
+}
       // Restaurant profile
       if (url.pathname.startsWith("/restaurant/")) {
         const slug = decodeURIComponent(
