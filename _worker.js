@@ -3,6 +3,7 @@ export default {
     const url = new URL(request.url);
 
     try {
+      // API: list restaurants
       if (url.pathname === "/api/restaurants") {
         const { results } = await env.DB.prepare(`
           SELECT
@@ -26,6 +27,128 @@ export default {
         return Response.json(results);
       }
 
+      // API: submit review
+      if (
+        url.pathname.startsWith("/api/restaurants/") &&
+        url.pathname.endsWith("/reviews") &&
+        request.method === "POST"
+      ) {
+        const slug = decodeURIComponent(
+          url.pathname
+            .replace("/api/restaurants/", "")
+            .replace("/reviews", "")
+        );
+
+        const restaurant = await env.DB.prepare(`
+          SELECT id
+          FROM restaurants
+          WHERE slug = ? AND status = 'published'
+          LIMIT 1
+        `).bind(slug).first();
+
+        if (!restaurant) {
+          return Response.json(
+            { error: "Restaurant not found." },
+            { status: 404 }
+          );
+        }
+
+        let data;
+
+        try {
+          data = await request.json();
+        } catch {
+          return Response.json(
+            { error: "Invalid request." },
+            { status: 400 }
+          );
+        }
+
+        const author = String(data.author_name || "").trim();
+        const email = String(data.author_email || "").trim();
+        const title = String(data.title || "").trim();
+        const body = String(data.body || "").trim();
+
+        const overall = Number(data.overall_rating);
+        const food = Number(data.food_rating);
+        const service = Number(data.service_rating);
+        const atmosphere = Number(data.atmosphere_rating);
+        const value = Number(data.value_rating);
+
+        if (!author || !body) {
+          return Response.json(
+            { error: "Name and review are required." },
+            { status: 400 }
+          );
+        }
+
+        if (
+          !Number.isInteger(overall) ||
+          overall < 1 ||
+          overall > 5
+        ) {
+          return Response.json(
+            { error: "Overall rating must be between 1 and 5." },
+            { status: 400 }
+          );
+        }
+
+        const ratings = [food, service, atmosphere, value];
+
+        if (
+          ratings.some(
+            r => !Number.isInteger(r) || r < 1 || r > 5
+          )
+        ) {
+          return Response.json(
+            { error: "All ratings must be between 1 and 5." },
+            { status: 400 }
+          );
+        }
+
+        if (author.length > 80 || body.length > 3000) {
+          return Response.json(
+            { error: "Review is too long." },
+            { status: 400 }
+          );
+        }
+
+        await env.DB.prepare(`
+          INSERT INTO reviews (
+            restaurant_id,
+            author_name,
+            author_email,
+            title,
+            body,
+            overall_rating,
+            food_rating,
+            service_rating,
+            atmosphere_rating,
+            value_rating,
+            status
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+        `).bind(
+          restaurant.id,
+          author,
+          email || null,
+          title || null,
+          body,
+          overall,
+          food,
+          service,
+          atmosphere,
+          value
+        ).run();
+
+        return Response.json({
+          success: true,
+          message:
+            "Thank you! Your review has been submitted and is awaiting moderation."
+        });
+      }
+
+      // Restaurant profile
       if (url.pathname.startsWith("/restaurant/")) {
         const slug = decodeURIComponent(
           url.pathname.replace("/restaurant/", "")
@@ -42,7 +165,12 @@ export default {
         `).bind(slug).first();
 
         if (!restaurant) {
-          return new Response("Restaurant not found", { status: 404 });
+          return new Response(notFoundPage(), {
+            status: 404,
+            headers: {
+              "content-type": "text/html;charset=UTF-8"
+            }
+          });
         }
 
         const { results: reviews } = await env.DB.prepare(`
@@ -57,7 +185,8 @@ export default {
             value_rating,
             created_at
           FROM reviews
-          WHERE restaurant_id = ? AND status = 'approved'
+          WHERE restaurant_id = ?
+            AND status = 'approved'
           ORDER BY created_at DESC
         `).bind(restaurant.id).all();
 
@@ -71,6 +200,7 @@ export default {
         );
       }
 
+      // Homepage
       return new Response(await homePage(env), {
         headers: {
           "content-type": "text/html;charset=UTF-8",
@@ -81,7 +211,12 @@ export default {
     } catch (error) {
       return new Response(
         "Tastify database error: " + error.message,
-        { status: 500 }
+        {
+          status: 500,
+          headers: {
+            "content-type": "text/plain;charset=UTF-8"
+          }
+        }
       );
     }
   }
@@ -114,7 +249,7 @@ async function homePage(env) {
       <div class="restaurant-image">🍽️</div>
 
       <div>
-        <div class="rating">★ ${r.rating.toFixed(1)}</div>
+        <div class="rating">★ ${Number(r.rating).toFixed(1)}</div>
 
         <h3>${escapeHtml(r.name)}</h3>
 
@@ -133,7 +268,7 @@ async function homePage(env) {
         </p>
 
         <p class="reviews">
-          ${r.review_count} reviews
+          ${Number(r.review_count)} reviews
         </p>
 
         <a class="button"
@@ -148,7 +283,6 @@ async function homePage(env) {
   return `<!DOCTYPE html>
 
 <html>
-
 <head>
 
 <meta charset="UTF-8">
@@ -166,7 +300,6 @@ async function homePage(env) {
   --cream:#fffaf0;
   --paper:#ffffff;
   --gold:#d8a83e;
-  --orange:#f28c28;
   --ink:#17211f;
   --muted:#687572;
   --border:#e5e1d6;
@@ -194,7 +327,7 @@ h1,h2,h3 {
 }
 
 nav {
-  background:var(--paper);
+  background:white;
   border-bottom:1px solid var(--border);
   padding:18px 0;
 }
@@ -210,6 +343,7 @@ nav {
   font-size:28px;
   font-weight:bold;
   color:var(--deep);
+  text-decoration:none;
 }
 
 .logo span {
@@ -237,9 +371,11 @@ nav {
 .hero {
   padding:75px 0;
   background:
-    radial-gradient(circle at 85% 20%,
-    rgba(216,168,62,.25),
-    transparent 25%),
+    radial-gradient(
+      circle at 85% 20%,
+      rgba(216,168,62,.25),
+      transparent 25%
+    ),
     var(--cream);
 }
 
@@ -323,9 +459,7 @@ section {
   place-items:center;
   font-size:65px;
   background:
-    linear-gradient(135deg,
-    #dff4ee,
-    #f5dfaa);
+    linear-gradient(135deg,#dff4ee,#f5dfaa);
 }
 
 .restaurant-card h3 {
@@ -409,7 +543,6 @@ footer strong {
 }
 
 </style>
-
 </head>
 
 <body>
@@ -432,7 +565,6 @@ footer strong {
 </div>
 
 </nav>
-
 
 <main>
 
@@ -462,7 +594,6 @@ WE ASPIRE TO BE MAGICIANS.
 </div>
 
 </section>
-
 
 <section id="restaurants">
 
@@ -498,7 +629,6 @@ No restaurants have been published yet.
 
 </section>
 
-
 <section class="quote">
 
 <div class="container">
@@ -512,7 +642,6 @@ Good food is an experience worth discovering.
 </section>
 
 </main>
-
 
 <footer>
 
@@ -534,7 +663,6 @@ WE ASPIRE TO BE MAGICIANS.
 </footer>
 
 </body>
-
 </html>`;
 }
 
@@ -546,7 +674,7 @@ function restaurantPage(restaurant, reviews) {
       <article class="review">
 
         <div class="rating">
-          ★ ${review.overall_rating}/5
+          ★ ${Number(review.overall_rating)}/5
         </div>
 
         <h3>
@@ -591,6 +719,7 @@ body {
   background:#fffaf0;
   color:#17211f;
   font-family:Arial,sans-serif;
+  line-height:1.6;
 }
 
 .container {
@@ -635,7 +764,7 @@ main {
 
 .meta {
   color:#687572;
-  line-height:1.9;
+  line-height:2;
 }
 
 .button {
@@ -649,11 +778,73 @@ main {
 .review {
   background:white;
   border-bottom:1px solid #e5e1d6;
-  padding:20px 0;
+  padding:22px 0;
 }
 
 .review p {
   color:#687572;
+}
+
+.form-card {
+  background:white;
+  padding:25px;
+  border-radius:20px;
+  border:1px solid #e5e1d6;
+  margin-top:30px;
+}
+
+.form-row {
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:12px;
+}
+
+label {
+  display:block;
+  font-weight:bold;
+  font-size:13px;
+  margin:12px 0 5px;
+}
+
+input,
+textarea,
+select {
+  width:100%;
+  padding:12px;
+  border:1px solid #d8d5ca;
+  border-radius:8px;
+  font:inherit;
+  background:#fffdf8;
+}
+
+textarea {
+  min-height:130px;
+  resize:vertical;
+}
+
+.submit {
+  margin-top:18px;
+  background:#087f6c;
+  color:white;
+  border:0;
+  padding:13px 20px;
+  border-radius:25px;
+  font-weight:bold;
+}
+
+#message {
+  margin-top:15px;
+  font-weight:bold;
+}
+
+@media(max-width:600px) {
+  .form-row {
+    grid-template-columns:1fr;
+  }
+
+  h1 {
+    font-size:40px;
+  }
 }
 
 </style>
@@ -672,7 +863,7 @@ main {
 </a>
 
 <div>
-Restaurant Profile
+RESTAURANT PROFILE
 </div>
 
 <h1>
@@ -686,7 +877,6 @@ ${escapeHtml(restaurant.name)}
 </div>
 
 </header>
-
 
 <main>
 
@@ -716,7 +906,7 @@ ${escapeHtml(restaurant.price_range || "$$")}
 <br>
 
 <strong>⭐ Reviews:</strong>
-${restaurant.review_count}
+${Number(restaurant.review_count)}
 
 </div>
 
@@ -731,9 +921,267 @@ ${reviewHTML}
 
 </section>
 
+
+<section class="form-card">
+
+<h2>Write a Review</h2>
+
+<p class="muted">
+Share your experience. Your review will be checked by
+Tastify before appearing publicly.
+</p>
+
+<form id="reviewForm">
+
+<div class="form-row">
+
+<div>
+<label>Your name</label>
+<input
+  name="author_name"
+  maxlength="80"
+  required
+>
+</div>
+
+<div>
+<label>Email (optional)</label>
+<input
+  type="email"
+  name="author_email"
+  maxlength="150"
+>
+</div>
+
+</div>
+
+
+<label>Review title</label>
+
+<input
+  name="title"
+  maxlength="150"
+>
+
+
+<label>Overall rating</label>
+
+<select name="overall_rating" required>
+<option value="">Select rating</option>
+<option value="5">★★★★★ — 5</option>
+<option value="4">★★★★☆ — 4</option>
+<option value="3">★★★☆☆ — 3</option>
+<option value="2">★★☆☆☆ — 2</option>
+<option value="1">★☆☆☆☆ — 1</option>
+</select>
+
+
+<div class="form-row">
+
+<div>
+<label>Food</label>
+<select name="food_rating" required>
+<option value="">Select</option>
+<option value="5">5 — Excellent</option>
+<option value="4">4 — Very good</option>
+<option value="3">3 — Good</option>
+<option value="2">2 — Poor</option>
+<option value="1">1 — Very poor</option>
+</select>
+</div>
+
+<div>
+<label>Service</label>
+<select name="service_rating" required>
+<option value="">Select</option>
+<option value="5">5 — Excellent</option>
+<option value="4">4 — Very good</option>
+<option value="3">3 — Good</option>
+<option value="2">2 — Poor</option>
+<option value="1">1 — Very poor</option>
+</select>
+</div>
+
+</div>
+
+
+<div class="form-row">
+
+<div>
+<label>Atmosphere</label>
+<select name="atmosphere_rating" required>
+<option value="">Select</option>
+<option value="5">5 — Excellent</option>
+<option value="4">4 — Very good</option>
+<option value="3">3 — Good</option>
+<option value="2">2 — Poor</option>
+<option value="1">1 — Very poor</option>
+</select>
+</div>
+
+<div>
+<label>Value</label>
+<select name="value_rating" required>
+<option value="">Select</option>
+<option value="5">5 — Excellent</option>
+<option value="4">4 — Very good</option>
+<option value="3">3 — Good</option>
+<option value="2">2 — Poor</option>
+<option value="1">1 — Very poor</option>
+</select>
+</div>
+
+</div>
+
+
+<label>Your review</label>
+
+<textarea
+  name="body"
+  maxlength="3000"
+  required
+></textarea>
+
+
+<button class="submit" type="submit">
+Submit Review
+</button>
+
+<div id="message"></div>
+
+</form>
+
+</section>
+
 </div>
 
 </main>
+
+
+<script>
+
+const form = document.getElementById("reviewForm");
+
+form.addEventListener("submit", async function(event) {
+
+  event.preventDefault();
+
+  const message = document.getElementById("message");
+
+  message.textContent = "Submitting...";
+
+  const data = Object.fromEntries(
+    new FormData(form).entries()
+  );
+
+  for (const key of [
+    "overall_rating",
+    "food_rating",
+    "service_rating",
+    "atmosphere_rating",
+    "value_rating"
+  ]) {
+    data[key] = Number(data[key]);
+  }
+
+  try {
+
+    const response = await fetch(
+      "/api/restaurants/${encodeURIComponent(restaurant.slug)}/reviews",
+      {
+        method:"POST",
+        headers:{
+          "content-type":"application/json"
+        },
+        body:JSON.stringify(data)
+      }
+    );
+
+    const result = await response.json();
+
+    if (!response.ok) {
+      throw new Error(
+        result.error || "Unable to submit review."
+      );
+    }
+
+    message.textContent =
+      "✓ " + result.message;
+
+    form.reset();
+
+  } catch (error) {
+
+    message.textContent =
+      "Error: " + error.message;
+
+  }
+
+});
+
+</script>
+
+</body>
+
+</html>`;
+}
+
+
+function notFoundPage() {
+
+  return `<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta name="viewport"
+      content="width=device-width,initial-scale=1">
+
+<title>Tastify — Not Found</title>
+
+<style>
+
+body {
+  margin:0;
+  min-height:100vh;
+  display:grid;
+  place-items:center;
+  background:#fffaf0;
+  color:#17211f;
+  font-family:Arial,sans-serif;
+  text-align:center;
+}
+
+h1 {
+  font-family:Georgia,serif;
+  font-size:60px;
+}
+
+a {
+  color:#087f6c;
+  font-weight:bold;
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div>
+
+<h1>404</h1>
+
+<p>
+This realm hasn't been discovered yet.
+</p>
+
+<a href="/">
+Return to Tastify
+</a>
+
+</div>
 
 </body>
 
