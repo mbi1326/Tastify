@@ -1,524 +1,1169 @@
-const restaurants = [
-  {
-    id: "cafe-aylanto",
-    name: "Café Aylanto",
-    city: "Islamabad",
-    area: "F-6",
-    cuisine: "Italian • Continental",
-    price: "$$$",
-    rating: 4.8,
-    description: "A polished dining experience with elegant food and a relaxed atmosphere.",
-    order: ["Signature Pasta", "Grilled Chicken"]
-  },
-  {
-    id: "spice-garden",
-    name: "Spice Garden",
-    city: "Islamabad",
-    area: "Blue Area",
-    cuisine: "Pakistani • Desi",
-    price: "$$",
-    rating: 4.6,
-    description: "Comforting Pakistani favourites in a welcoming setting.",
-    order: ["Karahi", "Seekh Kebab"]
-  }
-];
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
 
-const recipes = [
-  {
-    title: "Creamy Garlic Pasta",
-    category: "Quick & Easy",
-    time: "30 min",
-    rating: 4.8,
-    description: "A silky, garlicky pasta that's perfect for an easy dinner."
-  },
-  {
-    title: "Crispy Chicken Burgers",
-    category: "Comfort Food",
-    time: "35 min",
-    rating: 4.7,
-    description: "Crispy chicken, fresh vegetables and a creamy sauce."
-  }
-];
+    if (url.pathname !== "/") {
+      return new Response(notFoundPage(), {
+        headers: { "content-type": "text/html;charset=UTF-8" },
+        status: 404
+      });
+    }
 
-const reviews = [
-  {
-    restaurant: "cafe-aylanto",
-    author: "Tastify Guest",
-    rating: 5,
-    title: "Beautiful experience",
-    body: "Great atmosphere and delicious food."
+    return new Response(homePage(), {
+      headers: {
+        "content-type": "text/html;charset=UTF-8",
+        "cache-control": "no-cache"
+      }
+    });
   }
-];
+};
 
-const page = `
-<!DOCTYPE html>
-<html>
+function homePage() {
+  return `<!DOCTYPE html>
+<html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Tastify — Discover With Tastify</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Tastify — Discover Food, Recipes & Restaurants</title>
+
+<meta name="description" content="Tastify — Discover recipes, food stories, restaurants and honest reviews.">
 
 <style>
-:root{
---emerald:#063d32;
---green:#01796f;
---cream:#f6f1df;
---paper:#fffdf5;
---gold:#d8ad52;
---text:#17352d;
---muted:#68756e;
+
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Playfair+Display:wght@500;600;700&display=swap');
+
+:root {
+  --emerald: #087f6c;
+  --deep-emerald: #075c50;
+  --light-emerald: #dff4ee;
+  --cream: #fffaf0;
+  --gold: #d8a83e;
+  --orange: #f28c28;
+  --ink: #17211f;
+  --muted: #687572;
+  --white: #ffffff;
+  --border: #e7e5dc;
+  --shadow: 0 12px 35px rgba(20, 50, 45, .10);
 }
 
-*{box-sizing:border-box}
-
-body{
-margin:0;
-background:var(--cream);
-color:var(--text);
-font-family:Arial,sans-serif;
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
 }
 
-h1,h2,h3{
-font-family:Georgia,serif;
+html {
+  scroll-behavior: smooth;
 }
 
-.hero{
-background:var(--emerald);
-color:white;
-text-align:center;
-padding:65px 20px;
+body {
+  background: var(--cream);
+  color: var(--ink);
+  font-family: "DM Sans", sans-serif;
+  line-height: 1.6;
 }
 
-.logo{
-font-family:Georgia,serif;
-font-size:62px;
-color:var(--gold);
+h1,h2,h3,h4 {
+  font-family: "Playfair Display", Georgia, serif;
 }
 
-.eyebrow{
-font-size:11px;
-letter-spacing:3px;
-color:var(--gold);
-margin-top:5px;
+a {
+  color: inherit;
+  text-decoration: none;
 }
 
-.hero h1{
-font-size:42px;
-margin:22px 0 8px;
+.container {
+  width: min(1180px, 92%);
+  margin: auto;
 }
 
-.hero p{
-color:#f5f0df;
+/* NAVIGATION */
+
+.navbar {
+  height: 76px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  background: rgba(255,250,240,.94);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  backdrop-filter: blur(12px);
 }
 
-.tagline{
-font-size:11px!important;
-letter-spacing:1.5px;
-color:#ead6a0!important;
-margin-top:28px;
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: "Playfair Display", serif;
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--deep-emerald);
 }
 
-nav{
-background:var(--paper);
-padding:17px;
-text-align:center;
-border-bottom:1px solid #ddd0b0;
-position:sticky;
-top:0;
-z-index:5;
+.logo-mark {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  background: var(--emerald);
+  color: white;
+  display: grid;
+  place-items: center;
+  font-size: 20px;
 }
 
-nav a{
-color:var(--emerald);
-text-decoration:none;
-font-weight:bold;
-margin:0 12px;
+.nav-links {
+  display: flex;
+  gap: 30px;
+  align-items: center;
+  font-size: 14px;
+  font-weight: 600;
 }
 
-.container{
-max-width:1100px;
-margin:auto;
-padding:35px 20px;
+.nav-links a:hover {
+  color: var(--emerald);
 }
 
-.search{
-display:flex;
-gap:8px;
-margin-bottom:35px;
+.nav-button {
+  background: var(--emerald);
+  color: white;
+  padding: 11px 19px;
+  border-radius: 24px;
 }
 
-.search input{
-flex:1;
-padding:15px;
-border:1px solid #d5c7a7;
-border-radius:8px;
-background:var(--paper);
-font-size:16px;
+/* HERO */
+
+.hero {
+  padding: 80px 0 70px;
+  background:
+    radial-gradient(circle at 85% 15%, rgba(216,168,62,.22), transparent 25%),
+    radial-gradient(circle at 10% 80%, rgba(8,127,108,.13), transparent 25%);
 }
 
-button{
-border:0;
-border-radius:8px;
-background:var(--gold);
-padding:13px 18px;
-font-weight:bold;
-color:var(--text);
-cursor:pointer;
+.hero-grid {
+  display: grid;
+  grid-template-columns: 1.05fr .95fr;
+  gap: 55px;
+  align-items: center;
 }
 
-.grid{
-display:grid;
-grid-template-columns:repeat(3,1fr);
-gap:20px;
-margin-bottom:50px;
+.eyebrow {
+  display: inline-block;
+  color: var(--emerald);
+  background: var(--light-emerald);
+  padding: 7px 13px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  margin-bottom: 20px;
 }
 
-.card{
-background:var(--paper);
-border:1px solid #e1d4b6;
-border-radius:12px;
-padding:18px;
+.hero h1 {
+  font-size: clamp(48px, 7vw, 82px);
+  line-height: .98;
+  letter-spacing: -2px;
+  margin-bottom: 25px;
 }
 
-.image{
-height:170px;
-background:#dfe7df;
-border-radius:8px;
-display:flex;
-align-items:center;
-justify-content:center;
-color:var(--muted);
-margin-bottom:15px;
-font-family:Georgia,serif;
-font-size:20px;
+.hero h1 span {
+  color: var(--emerald);
+  font-style: italic;
 }
 
-.rating{
-color:#a66d08;
-font-weight:bold;
+.hero-text {
+  max-width: 580px;
+  font-size: 18px;
+  color: var(--muted);
+  margin-bottom: 28px;
 }
 
-.muted{
-color:var(--muted);
-line-height:1.6;
+.tagline {
+  border-left: 3px solid var(--gold);
+  padding-left: 17px;
+  font-family: "Playfair Display", serif;
+  font-size: 14px;
+  font-style: italic;
+  color: #625a48;
+  margin-bottom: 30px;
 }
 
-.chip{
-display:inline-block;
-background:#e4eee8;
-padding:8px 12px;
-border-radius:20px;
-margin:3px;
+.hero-actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
-.profile{
-display:none;
-margin-bottom:50px;
+.primary-btn,
+.secondary-btn {
+  display: inline-block;
+  padding: 14px 22px;
+  border-radius: 28px;
+  font-weight: 700;
+  font-size: 14px;
 }
 
-.review{
-border-bottom:1px solid #ded4bd;
-padding:15px 0;
+.primary-btn {
+  background: var(--emerald);
+  color: white;
+  box-shadow: 0 8px 20px rgba(8,127,108,.20);
 }
 
-footer{
-background:var(--emerald);
-color:white;
-text-align:center;
-padding:35px;
-margin-top:50px;
+.secondary-btn {
+  border: 1px solid var(--border);
+  background: white;
 }
 
-footer strong{
-color:var(--gold);
+/* HERO FOOD CARD */
+
+.hero-card {
+  min-height: 430px;
+  border-radius: 30px;
+  background:
+    linear-gradient(145deg, rgba(8,127,108,.95), rgba(5,83,72,.96));
+  position: relative;
+  overflow: hidden;
+  box-shadow: var(--shadow);
+  padding: 30px;
+  display: flex;
+  align-items: flex-end;
 }
 
-@media(max-width:700px){
-.grid{
-grid-template-columns:1fr;
+.food-art {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 150px;
+  transform: rotate(-7deg);
 }
-.logo{
-font-size:48px;
+
+.hero-card-info {
+  position: relative;
+  z-index: 2;
+  color: white;
+  width: 100%;
 }
-.hero h1{
-font-size:31px;
+
+.hero-card-info small {
+  opacity: .8;
 }
-.search{
-flex-direction:column;
+
+.hero-card-info h2 {
+  font-size: 30px;
+  margin-top: 4px;
 }
+
+/* SECTION */
+
+section {
+  padding: 80px 0;
 }
+
+.section-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: end;
+  gap: 20px;
+  margin-bottom: 35px;
+}
+
+.section-heading h2 {
+  font-size: 40px;
+}
+
+.section-heading p {
+  color: var(--muted);
+  max-width: 430px;
+}
+
+/* CATEGORIES */
+
+.categories {
+  display: grid;
+  grid-template-columns: repeat(4,1fr);
+  gap: 16px;
+}
+
+.category {
+  background: white;
+  border: 1px solid var(--border);
+  border-radius: 22px;
+  padding: 25px;
+  transition: .25s;
+}
+
+.category:hover {
+  transform: translateY(-5px);
+  box-shadow: var(--shadow);
+}
+
+.category-icon {
+  font-size: 36px;
+  margin-bottom: 15px;
+}
+
+.category h3 {
+  font-size: 21px;
+  margin-bottom: 5px;
+}
+
+.category p {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* FEATURED */
+
+.featured {
+  background: #f3eee1;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(3,1fr);
+  gap: 22px;
+}
+
+.card {
+  background: white;
+  border-radius: 22px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  transition: .25s;
+}
+
+.card:hover {
+  transform: translateY(-5px);
+  box-shadow: var(--shadow);
+}
+
+.card-image {
+  height: 210px;
+  display: grid;
+  place-items: center;
+  font-size: 80px;
+  background:
+    radial-gradient(circle at 50% 35%, #fff 0 12%, transparent 13%),
+    linear-gradient(135deg,#dff4ee,#f8e8b9);
+}
+
+.card-content {
+  padding: 20px;
+}
+
+.card-label {
+  color: var(--orange);
+  text-transform: uppercase;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 1px;
+}
+
+.card h3 {
+  font-size: 23px;
+  margin: 8px 0;
+}
+
+.card p {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.card-meta {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 16px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* RESTAURANTS */
+
+.restaurant-section {
+  background: white;
+}
+
+.restaurant-card {
+  display: grid;
+  grid-template-columns: 170px 1fr auto;
+  gap: 20px;
+  align-items: center;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  margin-bottom: 14px;
+}
+
+.restaurant-image {
+  height: 120px;
+  border-radius: 15px;
+  background: linear-gradient(135deg,#087f6c,#d8a83e);
+  display: grid;
+  place-items: center;
+  font-size: 50px;
+}
+
+.restaurant-info h3 {
+  font-size: 24px;
+}
+
+.restaurant-info p {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.rating {
+  color: #c58c13;
+  font-weight: 700;
+  margin: 5px 0;
+}
+
+.view-btn {
+  border: 1px solid var(--emerald);
+  color: var(--emerald);
+  padding: 10px 15px;
+  border-radius: 22px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+/* QUOTE */
+
+.quote-section {
+  background: var(--deep-emerald);
+  color: white;
+  text-align: center;
+}
+
+.quote-section h2 {
+  max-width: 850px;
+  margin: auto;
+  font-size: clamp(30px,5vw,52px);
+  line-height: 1.2;
+}
+
+.quote-section p {
+  margin-top: 22px;
+  color: #cce5df;
+  letter-spacing: 2px;
+  font-size: 11px;
+}
+
+/* NEWSLETTER */
+
+.newsletter {
+  background: #f3eee1;
+}
+
+.newsletter-box {
+  background: white;
+  border-radius: 28px;
+  padding: 45px;
+  text-align: center;
+  border: 1px solid var(--border);
+}
+
+.newsletter-box h2 {
+  font-size: 38px;
+}
+
+.newsletter-box p {
+  color: var(--muted);
+  margin: 10px auto 25px;
+  max-width: 520px;
+}
+
+.search-box {
+  max-width: 560px;
+  margin: auto;
+  display: flex;
+  gap: 8px;
+}
+
+.search-box input {
+  flex: 1;
+  padding: 14px 18px;
+  border: 1px solid var(--border);
+  border-radius: 25px;
+  outline: none;
+  font-family: inherit;
+}
+
+.search-box button {
+  border: 0;
+  background: var(--emerald);
+  color: white;
+  border-radius: 25px;
+  padding: 0 22px;
+  font-weight: 700;
+}
+
+/* FOOTER */
+
+footer {
+  background: #10201d;
+  color: white;
+  padding: 50px 0 25px;
+}
+
+.footer-grid {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1fr 1fr;
+  gap: 40px;
+}
+
+footer h3 {
+  margin-bottom: 12px;
+}
+
+footer p,
+footer a {
+  color: #aebcb8;
+  font-size: 13px;
+}
+
+footer a {
+  display: block;
+  margin: 7px 0;
+}
+
+.copyright {
+  border-top: 1px solid #29413c;
+  margin-top: 35px;
+  padding-top: 20px;
+  font-size: 12px;
+  color: #83928e;
+}
+
+/* MOBILE */
+
+@media(max-width:800px) {
+
+  .nav-links {
+    display: none;
+  }
+
+  .hero {
+    padding: 55px 0;
+  }
+
+  .hero-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .hero-card {
+    min-height: 330px;
+  }
+
+  .categories {
+    grid-template-columns: repeat(2,1fr);
+  }
+
+  .cards {
+    grid-template-columns: 1fr;
+  }
+
+  .restaurant-card {
+    grid-template-columns: 100px 1fr;
+  }
+
+  .restaurant-image {
+    height: 100px;
+  }
+
+  .view-btn {
+    grid-column: 2;
+    width: max-content;
+  }
+
+  .footer-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+}
+
+@media(max-width:480px) {
+
+  .logo {
+    font-size: 24px;
+  }
+
+  .hero h1 {
+    font-size: 50px;
+  }
+
+  section {
+    padding: 60px 0;
+  }
+
+  .section-heading {
+    display: block;
+  }
+
+  .section-heading h2 {
+    font-size: 34px;
+    margin-bottom: 8px;
+  }
+
+  .categories {
+    grid-template-columns: 1fr;
+  }
+
+  .newsletter-box {
+    padding: 30px 18px;
+  }
+
+  .search-box {
+    display: block;
+  }
+
+  .search-box input,
+  .search-box button {
+    width: 100%;
+    height: 48px;
+  }
+
+  .search-box button {
+    margin-top: 8px;
+  }
+
+  .footer-grid {
+    grid-template-columns: 1fr;
+  }
+
+}
+
 </style>
 </head>
 
 <body>
 
-<header class="hero">
-<div class="logo">Tastify</div>
-<div class="eyebrow">FOOD • ART • DISCOVERY</div>
+<!-- NAVIGATION -->
 
-<h1>Discover With Tastify</h1>
+<header class="navbar">
+  <div class="container" style="display:flex;align-items:center;justify-content:space-between;width:100%;">
 
-<p>Good food. Great places. Honest reviews.</p>
+    <a href="/" class="logo">
+      <span class="logo-mark">✦</span>
+      Tastify
+    </a>
 
-<p class="tagline">
-IN THE REALMS WHERE FOOD AND ART UNITE,
-WE ASPIRE TO BE MAGICIANS.
-</p>
+    <nav class="nav-links">
+      <a href="#recipes">Recipes</a>
+      <a href="#restaurants">Restaurants</a>
+      <a href="#reviews">Reviews</a>
+      <a href="#stories">Food Stories</a>
+      <a href="#restaurants" class="nav-button">Discover</a>
+    </nav>
+
+  </div>
 </header>
 
-<nav>
-<a href="/">Home</a>
-<a href="#restaurants">Restaurants</a>
-<a href="#recipes">Recipes</a>
-<a href="#about">About</a>
-</nav>
 
-<main class="container">
+<!-- HERO -->
 
-<div class="search">
-<input id="search" placeholder="Search restaurants, cuisines or recipes">
-<button onclick="searchSite()">Search</button>
+<main>
+
+<section class="hero">
+<div class="container hero-grid">
+
+  <div>
+
+    <span class="eyebrow">Food • Art • Discovery</span>
+
+    <h1>
+      Discover<br>
+      <span>With Tastify.</span>
+    </h1>
+
+    <p class="hero-text">
+      Explore delicious recipes, discover remarkable restaurants,
+      read honest reviews and experience food from a different perspective.
+    </p>
+
+    <div class="tagline">
+      IN THE REALMS WHERE FOOD AND ART UNITE,<br>
+      WE ASPIRE TO BE MAGICIANS.
+    </div>
+
+    <div class="hero-actions">
+      <a href="#restaurants" class="primary-btn">
+        Explore Restaurants →
+      </a>
+
+      <a href="#recipes" class="secondary-btn">
+        Explore Recipes
+      </a>
+    </div>
+
+  </div>
+
+  <div class="hero-card">
+
+    <div class="food-art">🍜</div>
+
+    <div class="hero-card-info">
+      <small>FEATURED DISCOVERY</small>
+      <h2>A world of flavour awaits.</h2>
+    </div>
+
+  </div>
+
+</div>
+</section>
+
+
+<!-- EXPLORE -->
+
+<section>
+<div class="container">
+
+  <div class="section-heading">
+    <div>
+      <span class="eyebrow">Explore Tastify</span>
+      <h2>Something delicious<br>for everyone.</h2>
+    </div>
+
+    <p>
+      From your next homemade dinner to your next favourite restaurant,
+      Tastify helps you discover what to eat.
+    </p>
+  </div>
+
+  <div class="categories">
+
+    <a class="category" href="#recipes">
+      <div class="category-icon">🍳</div>
+      <h3>Recipes</h3>
+      <p>Simple recipes worth making.</p>
+    </a>
+
+    <a class="category" href="#restaurants">
+      <div class="category-icon">🍽️</div>
+      <h3>Restaurants</h3>
+      <p>Find places worth visiting.</p>
+    </a>
+
+    <a class="category" href="#reviews">
+      <div class="category-icon">⭐</div>
+      <h3>Reviews</h3>
+      <p>Discover what people really think.</p>
+    </a>
+
+    <a class="category" href="#stories">
+      <div class="category-icon">📖</div>
+      <h3>Food Stories</h3>
+      <p>Stories behind memorable food.</p>
+    </a>
+
+  </div>
+
+</div>
+</section>
+
+
+<!-- RECIPES -->
+
+<section id="recipes" class="featured">
+<div class="container">
+
+  <div class="section-heading">
+    <div>
+      <span class="eyebrow">From Our Kitchen</span>
+      <h2>Featured Recipes</h2>
+    </div>
+
+    <p>
+      Easy-to-follow recipes for home cooks,
+      from everyday favourites to something special.
+    </p>
+  </div>
+
+  <div class="cards">
+
+    <article class="card">
+
+      <div class="card-image">🍝</div>
+
+      <div class="card-content">
+
+        <span class="card-label">Easy Dinner</span>
+
+        <h3>Creamy Garlic Pasta</h3>
+
+        <p>
+          A comforting pasta dish with a rich,
+          creamy garlic sauce.
+        </p>
+
+        <div class="card-meta">
+          <span>⏱ 25 min</span>
+          <span>★ Easy</span>
+        </div>
+
+      </div>
+
+    </article>
+
+
+    <article class="card">
+
+      <div class="card-image">🥞</div>
+
+      <div class="card-content">
+
+        <span class="card-label">Breakfast</span>
+
+        <h3>Golden Morning Pancakes</h3>
+
+        <p>
+          Light, fluffy pancakes made for slow
+          weekend mornings.
+        </p>
+
+        <div class="card-meta">
+          <span>⏱ 20 min</span>
+          <span>★ Easy</span>
+        </div>
+
+      </div>
+
+    </article>
+
+
+    <article class="card">
+
+      <div class="card-image">🍰</div>
+
+      <div class="card-content">
+
+        <span class="card-label">Dessert</span>
+
+        <h3>Classic Chocolate Cake</h3>
+
+        <p>
+          Rich chocolate flavour with a soft,
+          indulgent crumb.
+        </p>
+
+        <div class="card-meta">
+          <span>⏱ 55 min</span>
+          <span>★ Medium</span>
+        </div>
+
+      </div>
+
+    </article>
+
+  </div>
+
+</div>
+</section>
+
+
+<!-- RESTAURANTS -->
+
+<section id="restaurants" class="restaurant-section">
+<div class="container">
+
+  <div class="section-heading">
+    <div>
+      <span class="eyebrow">Discover Nearby</span>
+      <h2>Restaurant Guide</h2>
+    </div>
+
+    <p>
+      Find restaurants by cuisine, location, price,
+      atmosphere and what you are craving.
+    </p>
+  </div>
+
+
+  <div class="restaurant-card">
+
+    <div class="restaurant-image">🍔</div>
+
+    <div class="restaurant-info">
+      <h3>The Green Table</h3>
+      <p>Modern • Burgers • Continental</p>
+      <div class="rating">★★★★★ 4.8</div>
+      <p>📍 Your City · $$</p>
+    </div>
+
+    <a href="#restaurants" class="view-btn">
+      View Restaurant
+    </a>
+
+  </div>
+
+
+  <div class="restaurant-card">
+
+    <div class="restaurant-image">🍕</div>
+
+    <div class="restaurant-info">
+      <h3>Casa Verde</h3>
+      <p>Italian • Pizza • Pasta</p>
+      <div class="rating">★★★★☆ 4.5</div>
+      <p>📍 Your City · $$</p>
+    </div>
+
+    <a href="#restaurants" class="view-btn">
+      View Restaurant
+    </a>
+
+  </div>
+
+
+  <div class="restaurant-card">
+
+    <div class="restaurant-image">🍛</div>
+
+    <div class="restaurant-info">
+      <h3>The Spice Room</h3>
+      <p>Asian • Fusion • Family Dining</p>
+      <div class="rating">★★★★☆ 4.6</div>
+      <p>📍 Your City · $$$</p>
+    </div>
+
+    <a href="#restaurants" class="view-btn">
+      View Restaurant
+    </a>
+
+  </div>
+
+</div>
+</section>
+
+
+<!-- REVIEWS -->
+
+<section id="reviews" class="featured">
+<div class="container">
+
+  <div class="section-heading">
+    <div>
+      <span class="eyebrow">Taste Tested</span>
+      <h2>What makes a place worth visiting?</h2>
+    </div>
+  </div>
+
+  <div class="cards">
+
+    <article class="card">
+      <div class="card-content">
+        <div class="rating">★★★★★</div>
+        <h3>Food</h3>
+        <p>
+          Taste, presentation, portions and
+          overall quality.
+        </p>
+      </div>
+    </article>
+
+    <article class="card">
+      <div class="card-content">
+        <div class="rating">★★★★★</div>
+        <h3>Atmosphere</h3>
+        <p>
+          Ambience, comfort, cleanliness and
+          overall dining experience.
+        </p>
+      </div>
+    </article>
+
+    <article class="card">
+      <div class="card-content">
+        <div class="rating">★★★★★</div>
+        <h3>Value</h3>
+        <p>
+          Whether the experience is worth
+          what you pay.
+        </p>
+      </div>
+    </article>
+
+  </div>
+
+</div>
+</section>
+
+
+<!-- BRAND QUOTE -->
+
+<section id="stories" class="quote-section">
+
+<div class="container">
+
+  <h2>
+    “In the realms where food and art unite,
+    we aspire to be magicians.”
+  </h2>
+
+  <p>
+    TASTIFY · FOOD · RECIPES · RESTAURANTS · REVIEWS
+  </p>
+
 </div>
 
-<section id="restaurants">
-<h2>Restaurant Guide</h2>
-<div id="restaurantGrid" class="grid"></div>
 </section>
 
-<section id="profile" class="profile"></section>
 
-<section id="recipes">
-<h2>Featured Recipes</h2>
-<div id="recipeGrid" class="grid"></div>
-</section>
+<!-- SEARCH / FUTURE DISCOVERY -->
 
-<section id="about">
-<h2>About Tastify</h2>
-<p class="muted">
-Tastify is a food discovery platform for recipes, restaurants,
-reviews and food stories — where food meets creativity and art.
-</p>
+<section class="newsletter">
+
+<div class="container">
+
+  <div class="newsletter-box">
+
+    <span class="eyebrow">The Tastify Search</span>
+
+    <h2>What are you craving?</h2>
+
+    <p>
+      Search for recipes, restaurants, cuisines and
+      food experiences. Search will become fully
+      connected when we add the Tastify database.
+    </p>
+
+    <div class="search-box">
+
+      <input
+        type="text"
+        placeholder="Try “pizza”, “breakfast”, “restaurants”..."
+      >
+
+      <button onclick="demoSearch()">
+        Search
+      </button>
+
+    </div>
+
+  </div>
+
+</div>
+
 </section>
 
 </main>
 
+
+<!-- FOOTER -->
+
 <footer>
-<strong>Tastify</strong>
-<br><br>
-Discover With Tastify
-<br><br>
-IN THE REALMS WHERE FOOD AND ART UNITE,
-WE ASPIRE TO BE MAGICIANS.
+
+<div class="container">
+
+  <div class="footer-grid">
+
+    <div>
+      <div class="logo" style="color:white;">
+        <span class="logo-mark">✦</span>
+        Tastify
+      </div>
+
+      <p style="margin-top:15px;max-width:300px;">
+        Discover food. Discover places.
+        Discover something worth tasting.
+      </p>
+    </div>
+
+    <div>
+      <h3>Explore</h3>
+      <a href="#recipes">Recipes</a>
+      <a href="#restaurants">Restaurants</a>
+      <a href="#reviews">Reviews</a>
+      <a href="#stories">Food Stories</a>
+    </div>
+
+    <div>
+      <h3>Tastify</h3>
+      <a href="#">About</a>
+      <a href="#">Contact</a>
+      <a href="#">Submit a Restaurant</a>
+      <a href="#">Write a Review</a>
+    </div>
+
+    <div>
+      <h3>Follow</h3>
+      <a href="#">Instagram</a>
+      <a href="#">YouTube</a>
+      <a href="#">Facebook</a>
+    </div>
+
+  </div>
+
+  <div class="copyright">
+    © 2026 Tastify. All rights reserved.
+  </div>
+
+</div>
+
 </footer>
+
 
 <script>
 
-function showRestaurants(list){
+function demoSearch() {
+  const input = document.querySelector(".search-box input");
+  const value = input.value.trim();
 
-document.getElementById("restaurantGrid").innerHTML=list.map(r => \`
+  if (!value) {
+    alert("What would you like to discover?");
+    return;
+  }
 
-<div class="card">
-
-<div class="image">
-Restaurant
-</div>
-
-<div class="rating">
-★ \${r.rating}
-</div>
-
-<h3>\${r.name}</h3>
-
-<p class="muted">
-\${r.area}, \${r.city}
-<br>
-\${r.cuisine} · \${r.price}
-</p>
-
-<p class="muted">
-\${r.description}
-</p>
-
-<button onclick="showProfile('\${r.id}')">
-View Restaurant
-</button>
-
-</div>
-
-\`).join("");
-
+  alert(
+    'Tastify search is coming soon. We will search for "' +
+    value +
+    '" once the database is connected.'
+  );
 }
-
-function showRecipes(list){
-
-document.getElementById("recipeGrid").innerHTML=list.map(r => \`
-
-<div class="card">
-
-<div class="image">
-Recipe
-</div>
-
-<div class="rating">
-★ \${r.rating}
-</div>
-
-<h3>\${r.title}</h3>
-
-<p class="muted">
-\${r.category} · \${r.time}
-</p>
-
-<p class="muted">
-\${r.description}
-</p>
-
-</div>
-
-\`).join("");
-
-}
-
-function showProfile(id){
-
-const r=restaurants.find(x=>x.id===id);
-
-const rr=reviews.filter(x=>x.restaurant===id);
-
-document.getElementById("profile").style.display="block";
-
-document.getElementById("profile").innerHTML=\`
-
-<div class="card">
-
-<button onclick="closeProfile()">← Back</button>
-
-<div class="hero" style="margin:20px -18px">
-
-<div class="eyebrow">RESTAURANT PROFILE</div>
-
-<h1>\${r.name}</h1>
-
-<p>★ \${r.rating} · \${r.price}</p>
-
-</div>
-
-<h2>About</h2>
-
-<p class="muted">
-\${r.description}
-</p>
-
-<h2>What to Order</h2>
-
-<div>
-\${r.order.map(x=>\`<span class="chip">\${x}</span>\`).join("")}
-</div>
-
-<h2>Reviews</h2>
-
-\${rr.map(x=>\`
-
-<div class="review">
-
-<strong>\${x.title}</strong>
-
-<div class="rating">
-★ \${x.rating}
-</div>
-
-<p class="muted">
-\${x.body}
-</p>
-
-<small>\${x.author}</small>
-
-</div>
-
-\`).join("")}
-
-<h2>Write a Review</h2>
-
-<form onsubmit="submitReview(event,'\${r.id}')">
-
-<input name="author" placeholder="Your name" required
-style="padding:12px;width:100%;margin-bottom:8px">
-
-<input name="rating" type="number" min="1" max="5"
-placeholder="Rating 1–5" required
-style="padding:12px;width:100%;margin-bottom:8px">
-
-<input name="title" placeholder="Review title"
-style="padding:12px;width:100%;margin-bottom:8px">
-
-<textarea name="body" placeholder="Your review" required
-style="padding:12px;width:100%;height:100px;margin-bottom:8px"></textarea>
-
-<br>
-
-<button>Submit Review</button>
-
-</form>
-
-</div>
-\`;
-
-document.getElementById("profile").scrollIntoView();
-
-}
-
-function closeProfile(){
-
-document.getElementById("profile").style.display="none";
-
-}
-
-function submitReview(e,id){
-
-e.preventDefault();
-
-alert("Thank you! Your review has been submitted for moderation.");
-
-e.target.reset();
-
-}
-
-function searchSite(){
-
-const q=document.getElementById("search").value.toLowerCase();
-
-showRestaurants(
-restaurants.filter(r =>
-r.name.toLowerCase().includes(q) ||
-r.city.toLowerCase().includes(q) ||
-r.cuisine.toLowerCase().includes(q)
-)
-);
-
-showRecipes(
-recipes.filter(r =>
-r.title.toLowerCase().includes(q) ||
-r.category.toLowerCase().includes(q)
-)
-);
-
-}
-
-showRestaurants(restaurants);
-showRecipes(recipes);
 
 </script>
 
 </body>
-</html>
-`;
+</html>`;
+}
 
-export default {
-async fetch(request){
-return new Response(page,{
-headers:{
-"content-type":"text/html;charset=UTF-8"
+function notFoundPage() {
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tastify — Page Not Found</title>
+<style>
+body{
+  margin:0;
+  min-height:100vh;
+  display:grid;
+  place-items:center;
+  background:#fffaf0;
+  color:#17211f;
+  font-family:Arial,sans-serif;
+  text-align:center;
 }
-});
+h1{
+  font-family:Georgia,serif;
+  font-size:60px;
 }
-};
+a{
+  color:#087f6c;
+  font-weight:bold;
+}
+</style>
+</head>
+<body>
+<div>
+<h1>404</h1>
+<p>This realm hasn't been discovered yet.</p>
+<a href="/">Return to Tastify</a>
+</div>
+</body>
+</html>`;
+}
