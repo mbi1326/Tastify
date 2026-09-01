@@ -1,5 +1,12 @@
 {
   "name": "tastify",
   "main": "_worker.js",
-  "compatibility_date": "2026-09-01"
+  "compatibility_date": "2026-09-01",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "tastify-db",
+      "database_id": "1c21ac86-42c3-49b8-8935-11546615b360"
+    }
+  ]
 }
