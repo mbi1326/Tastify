@@ -247,7 +247,12 @@ export default {
 
         return origin === new URL(request.url).origin;
       };
-
+if (path === "/debug-admin" && method === "GET") {
+  return json({
+    passwordConfigured: Boolean(env.ADMIN_PASSWORD),
+    secretConfigured: Boolean(env.ADMIN_SECRET)
+  });
+}
       // ------------------------------------------------------------
       // ADMIN LOGIN
       // ------------------------------------------------------------
