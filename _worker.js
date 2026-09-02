@@ -115,7 +115,7 @@ export default {
       // ------------------------------------------------------------
       // AUTHENTICATION
       // ------------------------------------------------------------
-
+      // Tastify admin authentication
       const COOKIE_NAME = "tastify_admin";
       const SESSION_LENGTH = 12 * 60 * 60 * 1000;
 
