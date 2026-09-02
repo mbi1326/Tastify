@@ -36,9 +36,9 @@ export default {
 
       const escapeHtml = (value) => {
         return String(value ?? "")
-          .replace(/&/g, "&")
-          .replace(/</g, "<")
-          .replace(/>/g, ">")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
           .replace(/"/g, "&quot;")
           .replace(/'/g, "&#039;");
       };
@@ -1738,7 +1738,7 @@ export default {
       // ------------------------------------------------------------
 
       if (path === "/" && method === "GET") {
-        return html(await homePage(url));
+        return html(await homePage(url, env));
       }
 
       // ------------------------------------------------------------
@@ -1902,7 +1902,14 @@ async function replaceRecipeSteps(env, id, steps) {
 // ================================================================
 // SHARED HTML
 // ================================================================
-
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
 function pageShell(title, content, script = "") {
   return `<!DOCTYPE html>
 <html lang="en">
@@ -2422,7 +2429,7 @@ ${script}
 // HOME PAGE
 // ================================================================
 
-async function homePage(url) {
+async function homePage(url, env) {
   const search = url.searchParams.get("search") || "";
   const city = url.searchParams.get("city") || "";
 
