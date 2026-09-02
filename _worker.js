@@ -1,2035 +1,1897 @@
-const SESSION_COOKIE = "tastify_admin";
-const SESSION_HOURS = 12;
-
-/* =========================================================
-   TASTIFY WORKER
-   ========================================================= */
-
+ 
 export default {
   async fetch(request, env) {
     try {
       const url = new URL(request.url);
-      const method = request.method;
       const path = url.pathname;
+      const method = request.method.toUpperCase();
 
-      /* -----------------------------------------------------
-         PUBLIC API
-      ----------------------------------------------------- */
+      // ------------------------------------------------------------
+      // BASIC HELPERS
+      // ------------------------------------------------------------
 
-      if (path === "/api/cities" && method === "GET") {
-        return await getCities(env);
-      }
+      const json = (data, status = 200) =>
+        new Response(JSON.stringify(data), {
+          status,
+          headers: {
+            "content-type": "application/json; charset=UTF-8",
+            "cache-control": "no-store"
+          }
+        });
 
-      if (path === "/api/restaurants" && method === "GET") {
-        return await getRestaurants(env, url);
-      }
+      const html = (content, status = 200) =>
+        new Response(content, {
+          status,
+          headers: {
+            "content-type": "text/html; charset=UTF-8",
+            "cache-control": "no-store"
+          }
+        });
 
-      if (path === "/api/recipes" && method === "GET") {
-        return await getRecipes(env, url);
-      }
+      const redirect = (location, status = 302) =>
+        new Response(null, {
+          status,
+          headers: { location }
+        });
 
-      if (path === "/api/stories" && method === "GET") {
-        return await getStories(env, url);
-      }
+      const escapeHtml = (value) => {
+        return String(value ?? "")
+          .replace(/&/g, "&")
+          .replace(/</g, "<")
+          .replace(/>/g, ">")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#039;");
+      };
 
-      /* -----------------------------------------------------
-         PUBLIC RESTAURANT REVIEW
-      ----------------------------------------------------- */
+      const parseJson = async (request) => {
+        try {
+          return await request.json();
+        } catch {
+          return null;
+        }
+      };
 
-      if (
-        path.startsWith("/api/restaurants/") &&
-        path.endsWith("/reviews") &&
-        method === "POST"
-      ) {
-        const parts = path.split("/").filter(Boolean);
-        const slug = parts[2];
-        return await submitReview(env, request, slug);
-      }
+      const slugify = (value) => {
+        return String(value ?? "")
+          .toLowerCase()
+          .trim()
+          .replace(/[^a-z0-9]+/g, "-")
+          .replace(/^-+|-+$/g, "")
+          .slice(0, 80) || "item";
+      };
 
-      /* -----------------------------------------------------
-         ADMIN LOGIN / LOGOUT
-      ----------------------------------------------------- */
+      const safeUrl = (value) => {
+        if (!value) return "";
+        try {
+          const u = new URL(value);
+          if (u.protocol === "http:" || u.protocol === "https:") {
+            return u.toString();
+          }
+        } catch {}
+        return "";
+      };
+
+      const intValue = (value, fallback = 0) => {
+        const n = Number(value);
+        return Number.isFinite(n) ? Math.round(n) : fallback;
+      };
+
+      const ratingValue = (value) => {
+        const n = Number(value);
+        if (!Number.isFinite(n)) return 0;
+        return Math.max(0, Math.min(5, Math.round(n * 10) / 10));
+      };
+
+      const validReviewRating = (value) => {
+        const n = Number(value);
+        if (!Number.isFinite(n)) return null;
+        if (n < 1 || n > 5) return null;
+        return Math.round(n);
+      };
+
+      const makeUniqueSlug = async (table, candidate, excludeId = null) => {
+        let base = slugify(candidate);
+        let slug = base;
+        let counter = 2;
+
+        while (true) {
+          let query = `SELECT id FROM ${table} WHERE slug = ?`;
+          const params = [slug];
+
+          if (excludeId !== null) {
+            query += " AND id != ?";
+            params.push(excludeId);
+          }
+
+          const result = await env.DB.prepare(query).bind(...params).first();
+
+          if (!result) return slug;
+
+          slug = base + "-" + counter;
+          counter++;
+        }
+      };
+
+      // ------------------------------------------------------------
+      // AUTHENTICATION
+      // ------------------------------------------------------------
+
+      const COOKIE_NAME = "tastify_admin";
+      const SESSION_LENGTH = 12 * 60 * 60 * 1000;
+
+      const getCookie = (request, name) => {
+        const header = request.headers.get("cookie") || "";
+
+        const parts = header.split(";");
+
+        for (const part of parts) {
+          const index = part.indexOf("=");
+
+          if (index === -1) continue;
+
+          const key = part.slice(0, index).trim();
+
+          if (key === name) {
+            return decodeURIComponent(part.slice(index + 1).trim());
+          }
+        }
+
+        return null;
+      };
+
+      const constantTimeEqual = (a, b) => {
+        if (typeof a !== "string" || typeof b !== "string") return false;
+
+        if (a.length !== b.length) return false;
+
+        let result = 0;
+
+        for (let i = 0; i < a.length; i++) {
+          result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+        }
+
+        return result === 0;
+      };
+
+      const toBase64Url = (bytes) => {
+        let binary = "";
+
+        for (const byte of bytes) {
+          binary += String.fromCharCode(byte);
+        }
+
+        return btoa(binary)
+          .replace(/\+/g, "-")
+          .replace(/\//g, "_")
+          .replace(/=+$/g, "");
+      };
+
+      const fromBase64Url = (value) => {
+        const padded =
+          value.replace(/-/g, "+").replace(/_/g, "/") +
+          "=".repeat((4 - (value.length % 4)) % 4);
+
+        const binary = atob(padded);
+        const bytes = new Uint8Array(binary.length);
+
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+
+        return bytes;
+      };
+
+      const hmac = async (message) => {
+        if (!env.ADMIN_SECRET) {
+          throw new Error("ADMIN_SECRET is not configured");
+        }
+
+        const encoder = new TextEncoder();
+
+        const key = await crypto.subtle.importKey(
+          "raw",
+          encoder.encode(env.ADMIN_SECRET),
+          {
+            name: "HMAC",
+            hash: "SHA-256"
+          },
+          false,
+          ["sign"]
+        );
+
+        const signature = await crypto.subtle.sign(
+          "HMAC",
+          key,
+          encoder.encode(message)
+        );
+
+        return toBase64Url(new Uint8Array(signature));
+      };
+
+      const createSession = async () => {
+        const expires = Date.now() + SESSION_LENGTH;
+        const payload = String(expires);
+        const signature = await hmac(payload);
+
+        return payload + "." + signature;
+      };
+
+      const verifySession = async (request) => {
+        const cookie = getCookie(request, COOKIE_NAME);
+
+        if (!cookie) return false;
+
+        const parts = cookie.split(".");
+
+        if (parts.length !== 2) return false;
+
+        const expires = Number(parts[0]);
+
+        if (!Number.isFinite(expires) || expires < Date.now()) {
+          return false;
+        }
+
+        const expected = await hmac(parts[0]);
+
+        return constantTimeEqual(parts[1], expected);
+      };
+
+      const adminRequired = async () => {
+        return false;
+      };
+
+      const sameOrigin = (request) => {
+        const origin = request.headers.get("origin");
+
+        if (!origin) return true;
+
+        return origin === new URL(request.url).origin;
+      };
+
+      // ------------------------------------------------------------
+      // ADMIN LOGIN
+      // ------------------------------------------------------------
 
       if (path === "/admin/login" && method === "POST") {
-        return await adminLogin(env, request);
+        const body = await parseJson(request);
+
+        if (!body) {
+          return json({ error: "Invalid JSON" }, 400);
+        }
+
+        if (!env.ADMIN_PASSWORD || !env.ADMIN_SECRET) {
+          return json(
+            {
+              error:
+                "Admin secrets are not configured in Cloudflare Workers."
+            },
+            500
+          );
+        }
+
+        if (!constantTimeEqual(String(body.password || ""), env.ADMIN_PASSWORD)) {
+          return json({ error: "Incorrect password" }, 401);
+        }
+
+        const session = await createSession();
+
+        return new Response(
+          JSON.stringify({ success: true }),
+          {
+            status: 200,
+            headers: {
+              "content-type": "application/json; charset=UTF-8",
+              "set-cookie":
+                COOKIE_NAME +
+                "=" +
+                encodeURIComponent(session) +
+                "; Max-Age=43200; Path=/; HttpOnly; Secure; SameSite=Lax"
+            }
+          }
+        );
       }
 
       if (path === "/admin/logout" && method === "POST") {
-        return await adminLogout(env, request);
+        return new Response(
+          JSON.stringify({ success: true }),
+          {
+            status: 200,
+            headers: {
+              "content-type": "application/json; charset=UTF-8",
+              "set-cookie":
+                COOKIE_NAME +
+                "=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax"
+            }
+          }
+        );
       }
 
-      /* -----------------------------------------------------
-         ADMIN PAGE
-      ----------------------------------------------------- */
+      // ------------------------------------------------------------
+      // ADMIN PAGE
+      // ------------------------------------------------------------
 
       if (path === "/admin" && method === "GET") {
-        if (!(await isAdminAuthenticated(request, env))) {
-          return html(loginPage());
+        const loggedIn = await verifySession(request);
+
+        if (!loggedIn) {
+          return html(adminLoginPage());
         }
 
         return html(adminDashboard());
       }
 
-      /* -----------------------------------------------------
-         ADMIN API AUTHENTICATION
-      ----------------------------------------------------- */
+      // ------------------------------------------------------------
+      // ADMIN API AUTH
+      // ------------------------------------------------------------
 
       if (path.startsWith("/api/admin/")) {
-        if (!(await isAdminAuthenticated(request, env))) {
-          return json(
-            {
-              ok: false,
-              error: "Unauthorized"
-            },
-            401
-          );
+        const loggedIn = await verifySession(request);
+
+        if (!loggedIn) {
+          return json({ error: "Unauthorized" }, 401);
         }
 
-        if (!sameOrigin(request)) {
-          return json(
-            {
-              ok: false,
-              error: "Invalid request origin"
-            },
-            403
-          );
+        if (
+          ["POST", "PUT", "DELETE", "PATCH"].includes(method) &&
+          !sameOrigin(request)
+        ) {
+          return json({ error: "Invalid origin" }, 403);
         }
       }
 
-      /* -----------------------------------------------------
-         ADMIN STATS
-      ----------------------------------------------------- */
+      // ------------------------------------------------------------
+      // PUBLIC API - CITIES
+      // ------------------------------------------------------------
+
+      if (path === "/api/cities" && method === "GET") {
+        const result = await env.DB
+          .prepare(
+            `SELECT id, name, country, slug
+             FROM cities
+             ORDER BY name ASC`
+          )
+          .all();
+
+        return json({
+          cities: result.results || []
+        });
+      }
+
+      // ------------------------------------------------------------
+      // PUBLIC API - RESTAURANTS
+      // ------------------------------------------------------------
+
+      if (path === "/api/restaurants" && method === "GET") {
+        const search = (url.searchParams.get("search") || "").trim();
+        const city = (url.searchParams.get("city") || "").trim();
+        const category = (url.searchParams.get("category") || "").trim();
+
+        let sql = `
+          SELECT
+            r.id,
+            r.name,
+            r.slug,
+            r.description,
+            r.area,
+            r.address,
+            r.phone,
+            r.website,
+            r.cuisine,
+            r.price_range,
+            r.rating,
+            r.review_count,
+            r.featured,
+            c.name AS city_name,
+            c.slug AS city_slug
+          FROM restaurants r
+          LEFT JOIN cities c ON c.id = r.city_id
+          WHERE r.status = 'published'
+        `;
+
+        const params = [];
+
+        if (search) {
+          sql += `
+            AND (
+              r.name LIKE ?
+              OR r.description LIKE ?
+              OR r.cuisine LIKE ?
+              OR r.area LIKE ?
+            )
+          `;
+
+          const term = "%" + search + "%";
+
+          params.push(term, term, term, term);
+        }
+
+        if (city) {
+          sql += " AND c.slug = ?";
+          params.push(city);
+        }
+
+        if (category) {
+          sql += `
+            AND EXISTS (
+              SELECT 1
+              FROM restaurant_categories rc
+              WHERE rc.restaurant_id = r.id
+              AND LOWER(rc.category) = LOWER(?)
+            )
+          `;
+
+          params.push(category);
+        }
+
+        sql += `
+          ORDER BY r.featured DESC, r.rating DESC, r.name ASC
+        `;
+
+        const result = await env.DB.prepare(sql).bind(...params).all();
+
+        return json({
+          restaurants: result.results || []
+        });
+      }
+
+      // ------------------------------------------------------------
+      // PUBLIC API - RECIPES
+      // ------------------------------------------------------------
+
+      if (path === "/api/recipes" && method === "GET") {
+        const search = (url.searchParams.get("search") || "").trim();
+        const category = (url.searchParams.get("category") || "").trim();
+
+        let sql = `
+          SELECT
+            id,
+            title,
+            slug,
+            description,
+            category,
+            cuisine,
+            prep_minutes,
+            cook_minutes,
+            servings,
+            difficulty,
+            rating,
+            featured
+          FROM recipes
+          WHERE status = 'published'
+        `;
+
+        const params = [];
+
+        if (search) {
+          sql += `
+            AND (
+              title LIKE ?
+              OR description LIKE ?
+              OR cuisine LIKE ?
+              OR category LIKE ?
+            )
+          `;
+
+          const term = "%" + search + "%";
+
+          params.push(term, term, term, term);
+        }
+
+        if (category) {
+          sql += " AND LOWER(category) = LOWER(?)";
+          params.push(category);
+        }
+
+        sql += `
+          ORDER BY featured DESC, rating DESC, title ASC
+        `;
+
+        const result = await env.DB.prepare(sql).bind(...params).all();
+
+        return json({
+          recipes: result.results || []
+        });
+      }
+
+      // ------------------------------------------------------------
+      // PUBLIC API - STORIES
+      // ------------------------------------------------------------
+
+      if (path === "/api/stories" && method === "GET") {
+        const result = await env.DB
+          .prepare(
+            `SELECT
+              id,
+              title,
+              slug,
+              excerpt,
+              author_name,
+              category,
+              featured,
+              created_at
+             FROM food_stories
+             WHERE status = 'published'
+             ORDER BY featured DESC, created_at DESC`
+          )
+          .all();
+
+        return json({
+          stories: result.results || []
+        });
+      }
+
+      // ------------------------------------------------------------
+      // PUBLIC API - SUBMIT REVIEW
+      // ------------------------------------------------------------
+
+      const reviewMatch = path.match(
+        /^\/api\/restaurants\/([^/]+)\/reviews$/
+      );
+
+      if (reviewMatch && method === "POST") {
+        const slug = decodeURIComponent(reviewMatch[1]);
+
+        const restaurant = await env.DB
+          .prepare(
+            `SELECT id
+             FROM restaurants
+             WHERE slug = ?
+             AND status = 'published'`
+          )
+          .bind(slug)
+          .first();
+
+        if (!restaurant) {
+          return json({ error: "Restaurant not found" }, 404);
+        }
+
+        const body = await parseJson(request);
+
+        if (!body) {
+          return json({ error: "Invalid JSON" }, 400);
+        }
+
+        const authorName = String(body.author_name || "").trim();
+        const authorEmail = String(body.author_email || "").trim();
+        const title = String(body.title || "").trim();
+        const reviewBody = String(body.body || "").trim();
+
+        const overallRating = validReviewRating(body.overall_rating);
+
+        if (!authorName || !reviewBody || overallRating === null) {
+          return json(
+            {
+              error:
+                "Name, review text and a rating from 1 to 5 are required."
+            },
+            400
+          );
+        }
+
+        const foodRating =
+          validReviewRating(body.food_rating) === null
+            ? null
+            : validReviewRating(body.food_rating);
+
+        const serviceRating =
+          validReviewRating(body.service_rating) === null
+            ? null
+            : validReviewRating(body.service_rating);
+
+        const atmosphereRating =
+          validReviewRating(body.atmosphere_rating) === null
+            ? null
+            : validReviewRating(body.atmosphere_rating);
+
+        const valueRating =
+          validReviewRating(body.value_rating) === null
+            ? null
+            : validReviewRating(body.value_rating);
+
+        await env.DB
+          .prepare(
+            `INSERT INTO reviews
+            (
+              restaurant_id,
+              author_name,
+              author_email,
+              title,
+              body,
+              overall_rating,
+              food_rating,
+              service_rating,
+              atmosphere_rating,
+              value_rating,
+              status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')`
+          )
+          .bind(
+            restaurant.id,
+            authorName,
+            authorEmail,
+            title,
+            reviewBody,
+            overallRating,
+            foodRating,
+            serviceRating,
+            atmosphereRating,
+            valueRating
+          )
+          .run();
+
+        return json(
+          {
+            success: true,
+            message: "Thank you. Your review has been submitted for moderation."
+          },
+          201
+        );
+      }
+
+      // ------------------------------------------------------------
+      // RESTAURANT DETAIL PAGE
+      // ------------------------------------------------------------
+
+      const restaurantPageMatch = path.match(/^\/restaurant\/([^/]+)$/);
+
+      if (restaurantPageMatch && method === "GET") {
+        const slug = decodeURIComponent(restaurantPageMatch[1]);
+
+        const restaurant = await env.DB
+          .prepare(
+            `SELECT
+              r.*,
+              c.name AS city_name,
+              c.slug AS city_slug
+             FROM restaurants r
+             LEFT JOIN cities c ON c.id = r.city_id
+             WHERE r.slug = ?
+             AND r.status = 'published'`
+          )
+          .bind(slug)
+          .first();
+
+        if (!restaurant) {
+          return html(notFoundPage("Restaurant not found"), 404);
+        }
+
+        const reviews = await env.DB
+          .prepare(
+            `SELECT
+              id,
+              author_name,
+              title,
+              body,
+              overall_rating,
+              food_rating,
+              service_rating,
+              atmosphere_rating,
+              value_rating,
+              created_at
+             FROM reviews
+             WHERE restaurant_id = ?
+             AND status = 'approved'
+             ORDER BY created_at DESC`
+          )
+          .bind(restaurant.id)
+          .all();
+
+        const categories = await env.DB
+          .prepare(
+            `SELECT category
+             FROM restaurant_categories
+             WHERE restaurant_id = ?
+             ORDER BY category`
+          )
+          .bind(restaurant.id)
+          .all();
+
+        const photos = await env.DB
+          .prepare(
+            `SELECT image_url, caption
+             FROM restaurant_photos
+             WHERE restaurant_id = ?
+             ORDER BY sort_order, id`
+          )
+          .bind(restaurant.id)
+          .all();
+
+        return html(
+          restaurantPage(
+            restaurant,
+            categories.results || [],
+            reviews.results || [],
+            photos.results || []
+          )
+        );
+      }
+
+      // ------------------------------------------------------------
+      // RECIPE DETAIL PAGE
+      // ------------------------------------------------------------
+
+      const recipePageMatch = path.match(/^\/recipe\/([^/]+)$/);
+
+      if (recipePageMatch && method === "GET") {
+        const slug = decodeURIComponent(recipePageMatch[1]);
+
+        const recipe = await env.DB
+          .prepare(
+            `SELECT *
+             FROM recipes
+             WHERE slug = ?
+             AND status = 'published'`
+          )
+          .bind(slug)
+          .first();
+
+        if (!recipe) {
+          return html(notFoundPage("Recipe not found"), 404);
+        }
+
+        const ingredients = await env.DB
+          .prepare(
+            `SELECT ingredient, quantity
+             FROM recipe_ingredients
+             WHERE recipe_id = ?
+             ORDER BY sort_order, id`
+          )
+          .bind(recipe.id)
+          .all();
+
+        const steps = await env.DB
+          .prepare(
+            `SELECT step_number, instruction
+             FROM recipe_steps
+             WHERE recipe_id = ?
+             ORDER BY step_number, id`
+          )
+          .bind(recipe.id)
+          .all();
+
+        return html(
+          recipePage(
+            recipe,
+            ingredients.results || [],
+            steps.results || []
+          )
+        );
+      }
+
+      // ------------------------------------------------------------
+      // STORY DETAIL PAGE
+      // ------------------------------------------------------------
+
+      const storyPageMatch = path.match(/^\/story\/([^/]+)$/);
+
+      if (storyPageMatch && method === "GET") {
+        const slug = decodeURIComponent(storyPageMatch[1]);
+
+        const story = await env.DB
+          .prepare(
+            `SELECT *
+             FROM food_stories
+             WHERE slug = ?
+             AND status = 'published'`
+          )
+          .bind(slug)
+          .first();
+
+        if (!story) {
+          return html(notFoundPage("Story not found"), 404);
+        }
+
+        return html(storyPage(story));
+      }
+
+      // ============================================================
+      // ADMIN API - STATS
+      // ============================================================
 
       if (path === "/api/admin/stats" && method === "GET") {
-        return await adminStats(env);
+        const restaurants = await env.DB
+          .prepare("SELECT COUNT(*) AS count FROM restaurants")
+          .first();
+
+        const recipes = await env.DB
+          .prepare("SELECT COUNT(*) AS count FROM recipes")
+          .first();
+
+        const stories = await env.DB
+          .prepare("SELECT COUNT(*) AS count FROM food_stories")
+          .first();
+
+        const reviews = await env.DB
+          .prepare(
+            `SELECT COUNT(*) AS count
+             FROM reviews
+             WHERE status = 'pending'`
+          )
+          .first();
+
+        const cities = await env.DB
+          .prepare("SELECT COUNT(*) AS count FROM cities")
+          .first();
+
+        return json({
+          restaurants: restaurants?.count || 0,
+          recipes: recipes?.count || 0,
+          stories: stories?.count || 0,
+          pending_reviews: reviews?.count || 0,
+          cities: cities?.count || 0
+        });
       }
 
-      /* -----------------------------------------------------
-         ADMIN REVIEWS
-      ----------------------------------------------------- */
+      // ============================================================
+      // ADMIN API - REVIEWS
+      // ============================================================
 
       if (path === "/api/admin/reviews" && method === "GET") {
-        return await adminReviews(env, url);
-      }
+        const status = url.searchParams.get("status") || "pending";
 
-      if (
-        path.startsWith("/api/admin/reviews/") &&
-        method === "POST"
-      ) {
-        const parts = path.split("/").filter(Boolean);
-        const reviewId = Number(parts[3]);
+        const allowedStatuses = ["pending", "approved", "rejected", "all"];
 
-        if (parts[4] === "approve") {
-          return await approveReview(env, reviewId);
+        if (!allowedStatuses.includes(status)) {
+          return json({ error: "Invalid status" }, 400);
         }
 
-        if (parts[4] === "reject") {
-          return await rejectReview(env, reviewId);
+        let sql = `
+          SELECT
+            rv.*,
+            r.name AS restaurant_name,
+            r.slug AS restaurant_slug
+          FROM reviews rv
+          JOIN restaurants r ON r.id = rv.restaurant_id
+        `;
+
+        const params = [];
+
+        if (status !== "all") {
+          sql += " WHERE rv.status = ?";
+          params.push(status);
         }
+
+        sql += " ORDER BY rv.created_at DESC";
+
+        const result = await env.DB.prepare(sql).bind(...params).all();
+
+        return json({
+          reviews: result.results || []
+        });
       }
 
-      /* -----------------------------------------------------
-         ADMIN RESTAURANTS
-      ----------------------------------------------------- */
+      const approveMatch = path.match(
+        /^\/api\/admin\/reviews\/(\d+)\/approve$/
+      );
+
+      const rejectMatch = path.match(
+        /^\/api\/admin\/reviews\/(\d+)\/reject$/
+      );
+
+      if (approveMatch && method === "POST") {
+        const reviewId = Number(approveMatch[1]);
+
+        const review = await env.DB
+          .prepare(
+            `SELECT
+              rv.*,
+              r.rating AS old_rating,
+              r.review_count AS old_count
+             FROM reviews rv
+             JOIN restaurants r ON r.id = rv.restaurant_id
+             WHERE rv.id = ?`
+          )
+          .bind(reviewId)
+          .first();
+
+        if (!review) {
+          return json({ error: "Review not found" }, 404);
+        }
+
+        if (review.status === "approved") {
+          return json({ success: true, message: "Already approved" });
+        }
+
+        const before = await env.DB
+          .prepare(
+            `SELECT
+              COUNT(*) AS count,
+              COALESCE(SUM(overall_rating), 0) AS sum
+             FROM reviews
+             WHERE restaurant_id = ?
+             AND status = 'approved'`
+          )
+          .bind(review.restaurant_id)
+          .first();
+
+        await env.DB
+          .prepare(
+            `UPDATE reviews
+             SET status = 'approved'
+             WHERE id = ?`
+          )
+          .bind(reviewId)
+          .run();
+
+        const after = await env.DB
+          .prepare(
+            `SELECT
+              COUNT(*) AS count,
+              COALESCE(SUM(overall_rating), 0) AS sum
+             FROM reviews
+             WHERE restaurant_id = ?
+             AND status = 'approved'`
+          )
+          .bind(review.restaurant_id)
+          .first();
+
+        const oldRating = Number(review.old_rating || 0);
+        const oldCount = Number(review.old_count || 0);
+
+        const approvedBeforeCount = Number(before?.count || 0);
+        const approvedBeforeSum = Number(before?.sum || 0);
+
+        const approvedAfterCount = Number(after?.count || 0);
+        const approvedAfterSum = Number(after?.sum || 0);
+
+        const legacyCount = Math.max(
+          oldCount - approvedBeforeCount,
+          0
+        );
+
+        const legacySum =
+          oldRating * oldCount - approvedBeforeSum;
+
+        const totalCount =
+          legacyCount + approvedAfterCount;
+
+        const totalSum =
+          legacySum + approvedAfterSum;
+
+        const newRating =
+          totalCount > 0
+            ? Math.round((totalSum / totalCount) * 10) / 10
+            : 0;
+
+        await env.DB
+          .prepare(
+            `UPDATE restaurants
+             SET rating = ?,
+                 review_count = ?
+             WHERE id = ?`
+          )
+          .bind(
+            newRating,
+            totalCount,
+            review.restaurant_id
+          )
+          .run();
+
+        return json({
+          success: true,
+          rating: newRating,
+          review_count: totalCount
+        });
+      }
+
+      if (rejectMatch && method === "POST") {
+        const reviewId = Number(rejectMatch[1]);
+
+        const review = await env.DB
+          .prepare(
+            `SELECT
+              rv.*,
+              r.rating AS old_rating,
+              r.review_count AS old_count
+             FROM reviews rv
+             JOIN restaurants r ON r.id = rv.restaurant_id
+             WHERE rv.id = ?`
+          )
+          .bind(reviewId)
+          .first();
+
+        if (!review) {
+          return json({ error: "Review not found" }, 404);
+        }
+
+        const wasApproved = review.status === "approved";
+
+        if (wasApproved) {
+          const approvedBefore = await env.DB
+            .prepare(
+              `SELECT
+                COUNT(*) AS count,
+                COALESCE(SUM(overall_rating), 0) AS sum
+               FROM reviews
+               WHERE restaurant_id = ?
+               AND status = 'approved'`
+            )
+            .bind(review.restaurant_id)
+            .first();
+
+          await env.DB
+            .prepare(
+              `UPDATE reviews
+               SET status = 'rejected'
+               WHERE id = ?`
+            )
+            .bind(reviewId)
+            .run();
+
+          const approvedAfter = await env.DB
+            .prepare(
+              `SELECT
+                COUNT(*) AS count,
+                COALESCE(SUM(overall_rating), 0) AS sum
+               FROM reviews
+               WHERE restaurant_id = ?
+               AND status = 'approved'`
+            )
+            .bind(review.restaurant_id)
+            .first();
+
+          const oldRating = Number(review.old_rating || 0);
+          const oldCount = Number(review.old_count || 0);
+
+          const legacyCount = Math.max(
+            oldCount - Number(approvedBefore?.count || 0),
+            0
+          );
+
+          const legacySum =
+            oldRating * oldCount -
+            Number(approvedBefore?.sum || 0);
+
+          const totalCount =
+            legacyCount + Number(approvedAfter?.count || 0);
+
+          const totalSum =
+            legacySum + Number(approvedAfter?.sum || 0);
+
+          const newRating =
+            totalCount > 0
+              ? Math.round((totalSum / totalCount) * 10) / 10
+              : 0;
+
+          await env.DB
+            .prepare(
+              `UPDATE restaurants
+               SET rating = ?,
+                   review_count = ?
+               WHERE id = ?`
+            )
+            .bind(
+              newRating,
+              totalCount,
+              review.restaurant_id
+            )
+            .run();
+
+          return json({
+            success: true,
+            rating: newRating,
+            review_count: totalCount
+          });
+        }
+
+        await env.DB
+          .prepare(
+            `UPDATE reviews
+             SET status = 'rejected'
+             WHERE id = ?`
+          )
+          .bind(reviewId)
+          .run();
+
+        return json({ success: true });
+      }
+
+      // ============================================================
+      // ADMIN API - RESTAURANTS
+      // ============================================================
 
       if (path === "/api/admin/restaurants" && method === "GET") {
-        return await adminGetRestaurants(env);
+        const result = await env.DB
+          .prepare(
+            `SELECT
+              r.*,
+              c.name AS city_name
+             FROM restaurants r
+             LEFT JOIN cities c ON c.id = r.city_id
+             ORDER BY r.created_at DESC, r.name ASC`
+          )
+          .all();
+
+        return json({
+          restaurants: result.results || []
+        });
       }
 
       if (path === "/api/admin/restaurants" && method === "POST") {
-        return await adminCreateRestaurant(env, request);
+        const body = await parseJson(request);
+
+        if (!body) {
+          return json({ error: "Invalid JSON" }, 400);
+        }
+
+        const name = String(body.name || "").trim();
+
+        if (!name) {
+          return json({ error: "Restaurant name is required" }, 400);
+        }
+
+        const slug = await makeUniqueSlug(
+          "restaurants",
+          body.slug || name
+        );
+
+        const cityId =
+          body.city_id === "" ||
+          body.city_id === null ||
+          body.city_id === undefined
+            ? null
+            : intValue(body.city_id, 0) || null;
+
+        const description = String(body.description || "").trim();
+        const area = String(body.area || "").trim();
+        const address = String(body.address || "").trim();
+        const phone = String(body.phone || "").trim();
+        const website = safeUrl(String(body.website || "").trim());
+        const cuisine = String(body.cuisine || "").trim();
+        const priceRange = String(body.price_range || "").trim();
+        const rating = ratingValue(body.rating);
+        const reviewCount = Math.max(0, intValue(body.review_count));
+        const featured = body.featured ? 1 : 0;
+
+        const status =
+          body.status === "draft" ? "draft" : "published";
+
+        const result = await env.DB
+          .prepare(
+            `INSERT INTO restaurants
+            (
+              name,
+              slug,
+              description,
+              city_id,
+              area,
+              address,
+              phone,
+              website,
+              cuisine,
+              price_range,
+              rating,
+              review_count,
+              featured,
+              status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .bind(
+            name,
+            slug,
+            description,
+            cityId,
+            area,
+            address,
+            phone,
+            website,
+            cuisine,
+            priceRange,
+            rating,
+            reviewCount,
+            featured,
+            status
+          )
+          .run();
+
+        const id = result.meta?.last_row_id;
+
+        await replaceRestaurantCategories(env, id, body.categories);
+
+        return json(
+          {
+            success: true,
+            id,
+            slug
+          },
+          201
+        );
       }
 
-      if (
-        path.startsWith("/api/admin/restaurants/") &&
-        method === "PUT"
-      ) {
-        const id = Number(path.split("/").filter(Boolean)[3]);
-        return await adminUpdateRestaurant(env, request, id);
+      const restaurantAdminMatch = path.match(
+        /^\/api\/admin\/restaurants\/(\d+)$/
+      );
+
+      if (restaurantAdminMatch && method === "PUT") {
+        const id = Number(restaurantAdminMatch[1]);
+
+        const existing = await env.DB
+          .prepare(
+            `SELECT id
+             FROM restaurants
+             WHERE id = ?`
+          )
+          .bind(id)
+          .first();
+
+        if (!existing) {
+          return json({ error: "Restaurant not found" }, 404);
+        }
+
+        const body = await parseJson(request);
+
+        if (!body) {
+          return json({ error: "Invalid JSON" }, 400);
+        }
+
+        const name = String(body.name || "").trim();
+
+        if (!name) {
+          return json({ error: "Restaurant name is required" }, 400);
+        }
+
+        const slug = await makeUniqueSlug(
+          "restaurants",
+          body.slug || name,
+          id
+        );
+
+        const cityId =
+          body.city_id === "" ||
+          body.city_id === null ||
+          body.city_id === undefined
+            ? null
+            : intValue(body.city_id, 0) || null;
+
+        await env.DB
+          .prepare(
+            `UPDATE restaurants
+             SET
+              name = ?,
+              slug = ?,
+              description = ?,
+              city_id = ?,
+              area = ?,
+              address = ?,
+              phone = ?,
+              website = ?,
+              cuisine = ?,
+              price_range = ?,
+              rating = ?,
+              review_count = ?,
+              featured = ?,
+              status = ?
+             WHERE id = ?`
+          )
+          .bind(
+            name,
+            slug,
+            String(body.description || "").trim(),
+            cityId,
+            String(body.area || "").trim(),
+            String(body.address || "").trim(),
+            String(body.phone || "").trim(),
+            safeUrl(String(body.website || "").trim()),
+            String(body.cuisine || "").trim(),
+            String(body.price_range || "").trim(),
+            ratingValue(body.rating),
+            Math.max(0, intValue(body.review_count)),
+            body.featured ? 1 : 0,
+            body.status === "draft" ? "draft" : "published",
+            id
+          )
+          .run();
+
+        await replaceRestaurantCategories(env, id, body.categories);
+
+        return json({
+          success: true,
+          id,
+          slug
+        });
       }
 
-      if (
-        path.startsWith("/api/admin/restaurants/") &&
-        method === "DELETE"
-      ) {
-        const id = Number(path.split("/").filter(Boolean)[3]);
-        return await adminDeleteRestaurant(env, id);
+      if (restaurantAdminMatch && method === "DELETE") {
+        const id = Number(restaurantAdminMatch[1]);
+
+        await env.DB
+          .prepare(
+            `DELETE FROM restaurants
+             WHERE id = ?`
+          )
+          .bind(id)
+          .run();
+
+        return json({ success: true });
       }
 
-      /* -----------------------------------------------------
-         ADMIN CITIES
-      ----------------------------------------------------- */
+      // ============================================================
+      // ADMIN API - CITIES
+      // ============================================================
 
       if (path === "/api/admin/cities" && method === "GET") {
-        return await adminGetCities(env);
+        const result = await env.DB
+          .prepare(
+            `SELECT *
+             FROM cities
+             ORDER BY name ASC`
+          )
+          .all();
+
+        return json({
+          cities: result.results || []
+        });
       }
 
       if (path === "/api/admin/cities" && method === "POST") {
-        return await adminCreateCity(env, request);
+        const body = await parseJson(request);
+
+        if (!body) {
+          return json({ error: "Invalid JSON" }, 400);
+        }
+
+        const name = String(body.name || "").trim();
+
+        if (!name) {
+          return json({ error: "City name is required" }, 400);
+        }
+
+        const slug = await makeUniqueSlug(
+          "cities",
+          body.slug || name
+        );
+
+        await env.DB
+          .prepare(
+            `INSERT INTO cities
+            (name, country, slug)
+            VALUES (?, ?, ?)`
+          )
+          .bind(
+            name,
+            String(body.country || "Pakistan").trim(),
+            slug
+          )
+          .run();
+
+        return json(
+          {
+            success: true,
+            slug
+          },
+          201
+        );
       }
 
-      /* -----------------------------------------------------
-         ADMIN RECIPES
-      ----------------------------------------------------- */
+      // ============================================================
+      // ADMIN API - RECIPES
+      // ============================================================
 
       if (path === "/api/admin/recipes" && method === "GET") {
-        return await adminGetRecipes(env);
+        const result = await env.DB
+          .prepare(
+            `SELECT *
+             FROM recipes
+             ORDER BY created_at DESC, title ASC`
+          )
+          .all();
+
+        return json({
+          recipes: result.results || []
+        });
       }
 
       if (path === "/api/admin/recipes" && method === "POST") {
-        return await adminCreateRecipe(env, request);
+        const body = await parseJson(request);
+
+        if (!body) {
+          return json({ error: "Invalid JSON" }, 400);
+        }
+
+        const title = String(body.title || "").trim();
+
+        if (!title) {
+          return json({ error: "Recipe title is required" }, 400);
+        }
+
+        const slug = await makeUniqueSlug(
+          "recipes",
+          body.slug || title
+        );
+
+        const result = await env.DB
+          .prepare(
+            `INSERT INTO recipes
+            (
+              title,
+              slug,
+              description,
+              category,
+              cuisine,
+              prep_minutes,
+              cook_minutes,
+              servings,
+              difficulty,
+              rating,
+              featured,
+              status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .bind(
+            title,
+            slug,
+            String(body.description || "").trim(),
+            String(body.category || "").trim(),
+            String(body.cuisine || "").trim(),
+            Math.max(0, intValue(body.prep_minutes)),
+            Math.max(0, intValue(body.cook_minutes)),
+            Math.max(1, intValue(body.servings, 1)),
+            String(body.difficulty || "Easy").trim(),
+            ratingValue(body.rating),
+            body.featured ? 1 : 0,
+            body.status === "draft" ? "draft" : "published"
+          )
+          .run();
+
+        const id = result.meta?.last_row_id;
+
+        await replaceRecipeIngredients(env, id, body.ingredients);
+        await replaceRecipeSteps(env, id, body.steps);
+
+        return json(
+          {
+            success: true,
+            id,
+            slug
+          },
+          201
+        );
       }
 
-      if (
-        path.startsWith("/api/admin/recipes/") &&
-        method === "PUT"
-      ) {
-        const id = Number(path.split("/").filter(Boolean)[3]);
-        return await adminUpdateRecipe(env, request, id);
+      const recipeAdminMatch = path.match(
+        /^\/api\/admin\/recipes\/(\d+)$/
+      );
+
+      if (recipeAdminMatch && method === "PUT") {
+        const id = Number(recipeAdminMatch[1]);
+
+        const existing = await env.DB
+          .prepare(
+            `SELECT id
+             FROM recipes
+             WHERE id = ?`
+          )
+          .bind(id)
+          .first();
+
+        if (!existing) {
+          return json({ error: "Recipe not found" }, 404);
+        }
+
+        const body = await parseJson(request);
+
+        if (!body) {
+          return json({ error: "Invalid JSON" }, 400);
+        }
+
+        const title = String(body.title || "").trim();
+
+        if (!title) {
+          return json({ error: "Recipe title is required" }, 400);
+        }
+
+        const slug = await makeUniqueSlug(
+          "recipes",
+          body.slug || title,
+          id
+        );
+
+        await env.DB
+          .prepare(
+            `UPDATE recipes
+             SET
+              title = ?,
+              slug = ?,
+              description = ?,
+              category = ?,
+              cuisine = ?,
+              prep_minutes = ?,
+              cook_minutes = ?,
+              servings = ?,
+              difficulty = ?,
+              rating = ?,
+              featured = ?,
+              status = ?
+             WHERE id = ?`
+          )
+          .bind(
+            title,
+            slug,
+            String(body.description || "").trim(),
+            String(body.category || "").trim(),
+            String(body.cuisine || "").trim(),
+            Math.max(0, intValue(body.prep_minutes)),
+            Math.max(0, intValue(body.cook_minutes)),
+            Math.max(1, intValue(body.servings, 1)),
+            String(body.difficulty || "Easy").trim(),
+            ratingValue(body.rating),
+            body.featured ? 1 : 0,
+            body.status === "draft" ? "draft" : "published",
+            id
+          )
+          .run();
+
+        await replaceRecipeIngredients(env, id, body.ingredients);
+        await replaceRecipeSteps(env, id, body.steps);
+
+        return json({
+          success: true,
+          id,
+          slug
+        });
       }
 
-      if (
-        path.startsWith("/api/admin/recipes/") &&
-        method === "DELETE"
-      ) {
-        const id = Number(path.split("/").filter(Boolean)[3]);
-        return await adminDeleteRecipe(env, id);
+      if (recipeAdminMatch && method === "DELETE") {
+        const id = Number(recipeAdminMatch[1]);
+
+        await env.DB
+          .prepare(
+            `DELETE FROM recipes
+             WHERE id = ?`
+          )
+          .bind(id)
+          .run();
+
+        return json({ success: true });
       }
 
-      /* -----------------------------------------------------
-         ADMIN STORIES
-      ----------------------------------------------------- */
+      // ============================================================
+      // ADMIN API - STORIES
+      // ============================================================
 
       if (path === "/api/admin/stories" && method === "GET") {
-        return await adminGetStories(env);
+        const result = await env.DB
+          .prepare(
+            `SELECT *
+             FROM food_stories
+             ORDER BY created_at DESC, title ASC`
+          )
+          .all();
+
+        return json({
+          stories: result.results || []
+        });
       }
 
       if (path === "/api/admin/stories" && method === "POST") {
-        return await adminCreateStory(env, request);
-      }
+        const body = await parseJson(request);
 
-      if (
-        path.startsWith("/api/admin/stories/") &&
-        method === "PUT"
-      ) {
-        const id = Number(path.split("/").filter(Boolean)[3]);
-        return await adminUpdateStory(env, request, id);
-      }
+        if (!body) {
+          return json({ error: "Invalid JSON" }, 400);
+        }
 
-      if (
-        path.startsWith("/api/admin/stories/") &&
-        method === "DELETE"
-      ) {
-        const id = Number(path.split("/").filter(Boolean)[3]);
-        return await adminDeleteStory(env, id);
-      }
+        const title = String(body.title || "").trim();
+        const content = String(body.content || "").trim();
 
-      /* -----------------------------------------------------
-         PUBLIC CONTENT PAGES
-      ----------------------------------------------------- */
+        if (!title || !content) {
+          return json(
+            {
+              error: "Story title and content are required"
+            },
+            400
+          );
+        }
 
-      if (path.startsWith("/restaurant/") && method === "GET") {
-        const slug = decodeURIComponent(
-          path.replace("/restaurant/", "")
+        const slug = await makeUniqueSlug(
+          "food_stories",
+          body.slug || title
         );
 
-        return await restaurantPage(env, slug);
+        const result = await env.DB
+          .prepare(
+            `INSERT INTO food_stories
+            (
+              title,
+              slug,
+              excerpt,
+              content,
+              author_name,
+              category,
+              featured,
+              status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+          )
+          .bind(
+            title,
+            slug,
+            String(body.excerpt || "").trim(),
+            content,
+            String(body.author_name || "Tastify").trim(),
+            String(body.category || "").trim(),
+            body.featured ? 1 : 0,
+            body.status === "draft" ? "draft" : "published"
+          )
+          .run();
+
+        return json(
+          {
+            success: true,
+            id: result.meta?.last_row_id,
+            slug
+          },
+          201
+        );
       }
 
-      if (path.startsWith("/recipe/") && method === "GET") {
-        const slug = decodeURIComponent(
-          path.replace("/recipe/", "")
+      const storyAdminMatch = path.match(
+        /^\/api\/admin\/stories\/(\d+)$/
+      );
+
+      if (storyAdminMatch && method === "PUT") {
+        const id = Number(storyAdminMatch[1]);
+
+        const existing = await env.DB
+          .prepare(
+            `SELECT id
+             FROM food_stories
+             WHERE id = ?`
+          )
+          .bind(id)
+          .first();
+
+        if (!existing) {
+          return json({ error: "Story not found" }, 404);
+        }
+
+        const body = await parseJson(request);
+
+        if (!body) {
+          return json({ error: "Invalid JSON" }, 400);
+        }
+
+        const title = String(body.title || "").trim();
+        const content = String(body.content || "").trim();
+
+        if (!title || !content) {
+          return json(
+            {
+              error: "Story title and content are required"
+            },
+            400
+          );
+        }
+
+        const slug = await makeUniqueSlug(
+          "food_stories",
+          body.slug || title,
+          id
         );
 
-        return await recipePage(env, slug);
+        await env.DB
+          .prepare(
+            `UPDATE food_stories
+             SET
+              title = ?,
+              slug = ?,
+              excerpt = ?,
+              content = ?,
+              author_name = ?,
+              category = ?,
+              featured = ?,
+              status = ?
+             WHERE id = ?`
+          )
+          .bind(
+            title,
+            slug,
+            String(body.excerpt || "").trim(),
+            content,
+            String(body.author_name || "Tastify").trim(),
+            String(body.category || "").trim(),
+            body.featured ? 1 : 0,
+            body.status === "draft" ? "draft" : "published",
+            id
+          )
+          .run();
+
+        return json({
+          success: true,
+          id,
+          slug
+        });
       }
 
-      if (path.startsWith("/story/") && method === "GET") {
-        const slug = decodeURIComponent(
-          path.replace("/story/", "")
+      if (storyAdminMatch && method === "DELETE") {
+        const id = Number(storyAdminMatch[1]);
+
+        await env.DB
+          .prepare(
+            `DELETE FROM food_stories
+             WHERE id = ?`
+          )
+          .bind(id)
+          .run();
+
+        return json({ success: true });
+      }
+
+      // ------------------------------------------------------------
+      // 404 API
+      // ------------------------------------------------------------
+
+      if (path.startsWith("/api/")) {
+        return json(
+          {
+            error: "API endpoint not found",
+            path
+          },
+          404
         );
-
-        return await storyPage(env, slug);
       }
 
-      /* -----------------------------------------------------
-         HOMEPAGE
-      ----------------------------------------------------- */
+      // ------------------------------------------------------------
+      // HOME PAGE
+      // ------------------------------------------------------------
 
       if (path === "/" && method === "GET") {
-        return await homePage(env, url);
+        return html(await homePage(url));
       }
 
-      return html(notFoundPage(), 404);
-    } catch (error) {
-      console.error("Worker error:", error);
+      // ------------------------------------------------------------
+      // UNKNOWN PAGE
+      // ------------------------------------------------------------
 
-      return json(
+      return html(notFoundPage("Page not found"), 404);
+
+    } catch (error) {
+      console.error("Tastify Worker Error:", error);
+
+      const url = new URL(request.url);
+
+      if (url.pathname.startsWith("/api/")) {
+        return new Response(
+          JSON.stringify({
+            error: "Internal server error"
+          }),
+          {
+            status: 500,
+            headers: {
+              "content-type": "application/json; charset=UTF-8"
+            }
+          }
+        );
+      }
+
+      return new Response(
+        "<h1>Tastify Error</h1><p>Something went wrong. Please try again.</p>",
         {
-          ok: false,
-          error: "Internal server error"
-        },
-        500
+          status: 500,
+          headers: {
+            "content-type": "text/html; charset=UTF-8"
+          }
+        }
       );
     }
   }
 };
 
 
-/* =========================================================
-   RESPONSE HELPERS
-   ========================================================= */
-
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: {
-      "Content-Type": "application/json; charset=utf-8",
-      "Cache-Control": "no-store"
-    }
-  });
-}
-
-function html(content, status = 200) {
-  return new Response(content, {
-    status,
-    headers: {
-      "Content-Type": "text/html; charset=utf-8",
-      "Cache-Control": "no-store"
-    }
-  });
-}
-
-
-/* =========================================================
-   SECURITY
-   ========================================================= */
-
-function constantTimeEqual(a, b) {
-  if (typeof a !== "string" || typeof b !== "string") {
-    return false;
-  }
-
-  if (a.length !== b.length) {
-    return false;
-  }
-
-  let result = 0;
-
-  for (let i = 0; i < a.length; i++) {
-    result |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  }
-
-  return result === 0;
-}
-
-async function hmacSign(secret, value) {
-  const encoder = new TextEncoder();
-
-  const key = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(secret),
-    {
-      name: "HMAC",
-      hash: "SHA-256"
-    },
-    false,
-    ["sign"]
-  );
-
-  const signature = await crypto.subtle.sign(
-    "HMAC",
-    key,
-    encoder.encode(value)
-  );
-
-  return arrayBufferToBase64Url(signature);
-}
-
-async function createSession(env) {
-  const expires = Date.now() + SESSION_HOURS * 60 * 60 * 1000;
-
-  const payload = String(expires);
-  const signature = await hmacSign(
-    env.ADMIN_SECRET,
-    payload
-  );
-
-  return payload + "." + signature;
-}
-
-async function verifySession(env, token) {
-  if (!token || !env.ADMIN_SECRET) {
-    return false;
-  }
-
-  const dot = token.lastIndexOf(".");
-
-  if (dot === -1) {
-    return false;
-  }
-
-  const payload = token.substring(0, dot);
-  const signature = token.substring(dot + 1);
-
-  const expires = Number(payload);
-
-  if (!Number.isFinite(expires)) {
-    return false;
-  }
-
-  if (Date.now() > expires) {
-    return false;
-  }
-
-  const expected = await hmacSign(
-    env.ADMIN_SECRET,
-    payload
-  );
-
-  return constantTimeEqual(signature, expected);
-}
-
-async function isAdminAuthenticated(request, env) {
-  if (!env.ADMIN_PASSWORD || !env.ADMIN_SECRET) {
-    return false;
-  }
-
-  const cookies = parseCookies(
-    request.headers.get("Cookie") || ""
-  );
-
-  return await verifySession(
-    env,
-    cookies[SESSION_COOKIE]
-  );
-}
-
-function parseCookies(header) {
-  const result = {};
-
-  header.split(";").forEach(function (part) {
-    const index = part.indexOf("=");
-
-    if (index === -1) {
-      return;
-    }
-
-    const name = part.substring(0, index).trim();
-    const value = part.substring(index + 1).trim();
-
-    result[name] = decodeURIComponent(value);
-  });
-
-  return result;
-}
-
-function sameOrigin(request) {
-  const origin = request.headers.get("Origin");
-
-  if (!origin) {
-    return true;
-  }
-
-  try {
-    const requestUrl = new URL(request.url);
-    const originUrl = new URL(origin);
-
-    return (
-      originUrl.protocol === requestUrl.protocol &&
-      originUrl.host === requestUrl.host
-    );
-  } catch {
-    return false;
-  }
-}
-
-function arrayBufferToBase64Url(buffer) {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
-  }
-
-  return btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
-
-
-/* =========================================================
-   ADMIN LOGIN
-   ========================================================= */
-
-async function adminLogin(env, request) {
-  if (!env.ADMIN_PASSWORD || !env.ADMIN_SECRET) {
-    return json(
-      {
-        ok: false,
-        error:
-          "ADMIN_PASSWORD and ADMIN_SECRET must be configured in Cloudflare Worker Secrets."
-      },
-      500
-    );
-  }
-
-  const body = await parseJson(request);
-
-  const password =
-    typeof body.password === "string"
-      ? body.password
-      : "";
-
-  if (!constantTimeEqual(password, env.ADMIN_PASSWORD)) {
-    return json(
-      {
-        ok: false,
-        error: "Incorrect password"
-      },
-      401
-    );
-  }
-
-  const session = await createSession(env);
-
-  return new Response(
-    JSON.stringify({
-      ok: true
-    }),
-    {
-      status: 200,
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        "Cache-Control": "no-store",
-        "Set-Cookie":
-          SESSION_COOKIE +
-          "=" +
-          encodeURIComponent(session) +
-          "; Max-Age=" +
-          SESSION_HOURS * 60 * 60 +
-          "; Path=/; HttpOnly; Secure; SameSite=Lax"
-      }
-    }
-  );
-}
-
-async function adminLogout(env, request) {
-  return new Response(
-    JSON.stringify({
-      ok: true
-    }),
-    {
-      status: 200,
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        "Set-Cookie":
-          SESSION_COOKIE +
-          "=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax"
-      }
-    }
-  );
-}
-
-
-/* =========================================================
-   PUBLIC CITIES
-   ========================================================= */
-
-async function getCities(env) {
-  const result = await env.DB.prepare(
-    "SELECT id, name, country, slug FROM cities ORDER BY name"
-  ).all();
-
-  return json({
-    ok: true,
-    cities: result.results || []
-  });
-}
-
-
-/* =========================================================
-   PUBLIC RESTAURANTS
-   ========================================================= */
-
-async function getRestaurants(env, url) {
-  const search = (url.searchParams.get("search") || "").trim();
-  const city = (url.searchParams.get("city") || "").trim();
-  const category = (url.searchParams.get("category") || "").trim();
-
-  let sql =
-    "SELECT r.id, r.name, r.slug, r.description, r.area, r.address, r.phone, r.website, r.cuisine, r.price_range, r.rating, r.review_count, r.featured, c.name AS city_name " +
-    "FROM restaurants r " +
-    "LEFT JOIN cities c ON c.id = r.city_id " +
-    "WHERE r.status = 'published'";
-
-  const params = [];
-
-  if (search) {
-    sql +=
-      " AND (r.name LIKE ? OR r.description LIKE ? OR r.cuisine LIKE ? OR r.area LIKE ?)";
-
-    const term = "%" + search + "%";
-
-    params.push(term, term, term, term);
-  }
-
-  if (city) {
-    sql += " AND c.slug = ?";
-    params.push(city);
-  }
-
-  if (category) {
-    sql +=
-      " AND EXISTS (SELECT 1 FROM restaurant_categories rc WHERE rc.restaurant_id = r.id AND rc.category = ?)";
-    params.push(category);
-  }
-
-  sql +=
-    " ORDER BY r.featured DESC, r.rating DESC, r.name ASC";
-
-  const result = await env.DB.prepare(sql)
-    .bind(...params)
-    .all();
-
-  const restaurants = result.results || [];
-
-  for (const restaurant of restaurants) {
-    const categories = await env.DB.prepare(
-      "SELECT category FROM restaurant_categories WHERE restaurant_id = ? ORDER BY category"
+// ================================================================
+// DATABASE HELPERS
+// ================================================================
+
+async function replaceRestaurantCategories(env, id, categories) {
+  if (!id) return;
+
+  const values = Array.isArray(categories)
+    ? categories
+    : String(categories || "")
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+
+  await env.DB
+    .prepare(
+      `DELETE FROM restaurant_categories
+       WHERE restaurant_id = ?`
     )
-      .bind(restaurant.id)
-      .all();
-
-    restaurant.categories = (categories.results || []).map(
-      function (row) {
-        return row.category;
-      }
-    );
-  }
-
-  return json({
-    ok: true,
-    restaurants
-  });
-}
-
-
-/* =========================================================
-   PUBLIC RECIPES
-   ========================================================= */
-
-async function getRecipes(env, url) {
-  const search = (url.searchParams.get("search") || "").trim();
-  const category = (url.searchParams.get("category") || "").trim();
-
-  let sql =
-    "SELECT id, title, slug, description, category, cuisine, prep_minutes, cook_minutes, servings, difficulty, rating, featured " +
-    "FROM recipes WHERE status = 'published'";
-
-  const params = [];
-
-  if (search) {
-    sql +=
-      " AND (title LIKE ? OR description LIKE ? OR cuisine LIKE ? OR category LIKE ?)";
-
-    const term = "%" + search + "%";
-
-    params.push(term, term, term, term);
-  }
-
-  if (category) {
-    sql += " AND category = ?";
-    params.push(category);
-  }
-
-  sql +=
-    " ORDER BY featured DESC, rating DESC, title ASC";
-
-  const result = await env.DB.prepare(sql)
-    .bind(...params)
-    .all();
-
-  return json({
-    ok: true,
-    recipes: result.results || []
-  });
-}
-
-
-/* =========================================================
-   PUBLIC STORIES
-   ========================================================= */
-
-async function getStories(env, url) {
-  const search = (url.searchParams.get("search") || "").trim();
-  const category = (url.searchParams.get("category") || "").trim();
-
-  let sql =
-    "SELECT id, title, slug, excerpt, author_name, category, featured, created_at " +
-    "FROM food_stories WHERE status = 'published'";
-
-  const params = [];
-
-  if (search) {
-    sql +=
-      " AND (title LIKE ? OR excerpt LIKE ? OR content LIKE ?)";
-
-    const term = "%" + search + "%";
-
-    params.push(term, term, term);
-  }
-
-  if (category) {
-    sql += " AND category = ?";
-    params.push(category);
-  }
-
-  sql +=
-    " ORDER BY featured DESC, created_at DESC, title ASC";
-
-  const result = await env.DB.prepare(sql)
-    .bind(...params)
-    .all();
-
-  return json({
-    ok: true,
-    stories: result.results || []
-  });
-}
-
-
-/* =========================================================
-   PUBLIC REVIEW SUBMISSION
-   ========================================================= */
-
-async function submitReview(env, request, slug) {
-  if (!slug) {
-    return json(
-      {
-        ok: false,
-        error: "Restaurant not found"
-      },
-      404
-    );
-  }
-
-  const restaurant = await env.DB.prepare(
-    "SELECT id FROM restaurants WHERE slug = ? AND status = 'published' LIMIT 1"
-  )
-    .bind(slug)
-    .first();
-
-  if (!restaurant) {
-    return json(
-      {
-        ok: false,
-        error: "Restaurant not found"
-      },
-      404
-    );
-  }
-
-  const body = await parseJson(request);
-
-  const authorName = cleanText(body.author_name);
-  const authorEmail = cleanText(body.author_email);
-  const title = cleanText(body.title);
-  const reviewBody = cleanText(body.body);
-
-  const overallRating = optionalRating(body.overall_rating);
-  const foodRating = optionalRating(body.food_rating);
-  const serviceRating = optionalRating(body.service_rating);
-  const atmosphereRating = optionalRating(body.atmosphere_rating);
-  const valueRating = optionalRating(body.value_rating);
-
-  if (!authorName) {
-    return json(
-      {
-        ok: false,
-        error: "Name is required"
-      },
-      400
-    );
-  }
-
-  if (!reviewBody) {
-    return json(
-      {
-        ok: false,
-        error: "Review is required"
-      },
-      400
-    );
-  }
-
-  if (!overallRating) {
-    return json(
-      {
-        ok: false,
-        error: "Overall rating must be between 1 and 5"
-      },
-      400
-    );
-  }
-
-  await env.DB.prepare(
-    "INSERT INTO reviews (restaurant_id, author_name, author_email, title, body, overall_rating, food_rating, service_rating, atmosphere_rating, value_rating, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')"
-  )
-    .bind(
-      restaurant.id,
-      authorName,
-      authorEmail || null,
-      title || null,
-      reviewBody,
-      overallRating,
-      foodRating,
-      serviceRating,
-      atmosphereRating,
-      valueRating
-    )
-    .run();
-
-  return json({
-    ok: true,
-    message:
-      "Thank you. Your review has been submitted for moderation."
-  });
-}
-
-
-/* =========================================================
-   ADMIN STATS
-   ========================================================= */
-
-async function adminStats(env) {
-  const restaurants = await env.DB.prepare(
-    "SELECT COUNT(*) AS count FROM restaurants"
-  ).first();
-
-  const recipes = await env.DB.prepare(
-    "SELECT COUNT(*) AS count FROM recipes"
-  ).first();
-
-  const stories = await env.DB.prepare(
-    "SELECT COUNT(*) AS count FROM food_stories"
-  ).first();
-
-  const pendingReviews = await env.DB.prepare(
-    "SELECT COUNT(*) AS count FROM reviews WHERE status = 'pending'"
-  ).first();
-
-  const approvedReviews = await env.DB.prepare(
-    "SELECT COUNT(*) AS count FROM reviews WHERE status = 'approved'"
-  ).first();
-
-  const cities = await env.DB.prepare(
-    "SELECT COUNT(*) AS count FROM cities"
-  ).first();
-
-  return json({
-    ok: true,
-    stats: {
-      restaurants: Number(restaurants?.count || 0),
-      recipes: Number(recipes?.count || 0),
-      stories: Number(stories?.count || 0),
-      pending_reviews: Number(pendingReviews?.count || 0),
-      approved_reviews: Number(approvedReviews?.count || 0),
-      cities: Number(cities?.count || 0)
-    }
-  });
-}
-
-
-/* =========================================================
-   ADMIN REVIEWS
-   ========================================================= */
-
-async function adminReviews(env, url) {
-  const status =
-    (url.searchParams.get("status") || "").trim();
-
-  let sql =
-    "SELECT rv.id, rv.restaurant_id, rv.author_name, rv.author_email, rv.title, rv.body, rv.overall_rating, rv.food_rating, rv.service_rating, rv.atmosphere_rating, rv.value_rating, rv.status, rv.created_at, r.name AS restaurant_name " +
-    "FROM reviews rv " +
-    "JOIN restaurants r ON r.id = rv.restaurant_id";
-
-  const params = [];
-
-  if (
-    status === "pending" ||
-    status === "approved" ||
-    status === "rejected"
-  ) {
-    sql += " WHERE rv.status = ?";
-    params.push(status);
-  }
-
-  sql += " ORDER BY rv.created_at DESC";
-
-  const result = await env.DB.prepare(sql)
-    .bind(...params)
-    .all();
-
-  return json({
-    ok: true,
-    reviews: result.results || []
-  });
-}
-
-
-/* =========================================================
-   REVIEW AGGREGATE CALCULATION
-   ========================================================= */
-
-async function recomputeRestaurantRating(
-  env,
-  restaurantId,
-  oldRating,
-  oldCount,
-  approvedBeforeSum
-) {
-  const approvedAfter = await env.DB.prepare(
-    "SELECT COUNT(*) AS count, COALESCE(SUM(overall_rating), 0) AS sum FROM reviews WHERE restaurant_id = ? AND status = 'approved'"
-  )
-    .bind(restaurantId)
-    .first();
-
-  const approvedAfterCount = Number(
-    approvedAfter?.count || 0
-  );
-
-  const approvedAfterSum = Number(
-    approvedAfter?.sum || 0
-  );
-
-  const legacyCount = Math.max(
-    Number(oldCount || 0) -
-      Number(
-        await getApprovedCountBeforeChange(
-          env,
-          restaurantId,
-          approvedBeforeSum
-        )
-      ),
-    0
-  );
-
-  let legacySum =
-    Number(oldRating || 0) * Number(oldCount || 0) -
-    Number(approvedBeforeSum || 0);
-
-  if (legacySum < 0) {
-    legacySum = 0;
-  }
-
-  const totalCount =
-    legacyCount + approvedAfterCount;
-
-  const totalSum =
-    legacySum + approvedAfterSum;
-
-  const rating =
-    totalCount > 0
-      ? Math.round((totalSum / totalCount) * 10) / 10
-      : 0;
-
-  await env.DB.prepare(
-    "UPDATE restaurants SET rating = ?, review_count = ? WHERE id = ?"
-  )
-    .bind(rating, totalCount, restaurantId)
-    .run();
-
-  return {
-    rating,
-    review_count: totalCount
-  };
-}
-
-/*
-  We need the count of approved reviews BEFORE the status
-  change. Since the caller supplies the previous approved sum,
-  this helper calculates the count independently.
-*/
-async function getApprovedCountBeforeChange(
-  env,
-  restaurantId,
-  approvedBeforeSum
-) {
-  /*
-    The review status has already changed by the time this
-    function is called. For reliable seeded-rating behavior,
-    callers below use a dedicated aggregate calculation
-    instead.
-  */
-  const result = await env.DB.prepare(
-    "SELECT COUNT(*) AS count FROM reviews WHERE restaurant_id = ? AND status = 'approved'"
-  )
-    .bind(restaurantId)
-    .first();
-
-  return Number(result?.count || 0);
-}
-
-
-/* =========================================================
-   APPROVE REVIEW
-   ========================================================= */
-
-async function approveReview(env, reviewId) {
-  if (!Number.isInteger(reviewId) || reviewId <= 0) {
-    return json(
-      {
-        ok: false,
-        error: "Invalid review ID"
-      },
-      400
-    );
-  }
-
-  const review = await env.DB.prepare(
-    "SELECT id, restaurant_id, overall_rating, status FROM reviews WHERE id = ? LIMIT 1"
-  )
-    .bind(reviewId)
-    .first();
-
-  if (!review) {
-    return json(
-      {
-        ok: false,
-        error: "Review not found"
-      },
-      404
-    );
-  }
-
-  if (review.status === "approved") {
-    return json({
-      ok: true,
-      message: "Review is already approved"
-    });
-  }
-
-  const restaurant = await env.DB.prepare(
-    "SELECT id, rating, review_count FROM restaurants WHERE id = ? LIMIT 1"
-  )
-    .bind(review.restaurant_id)
-    .first();
-
-  if (!restaurant) {
-    return json(
-      {
-        ok: false,
-        error: "Restaurant not found"
-      },
-      404
-    );
-  }
-
-  const before = await env.DB.prepare(
-    "SELECT COUNT(*) AS count, COALESCE(SUM(overall_rating), 0) AS sum FROM reviews WHERE restaurant_id = ? AND status = 'approved'"
-  )
-    .bind(review.restaurant_id)
-    .first();
-
-  const approvedBeforeCount = Number(
-    before?.count || 0
-  );
-
-  const approvedBeforeSum = Number(
-    before?.sum || 0
-  );
-
-  await env.DB.prepare(
-    "UPDATE reviews SET status = 'approved' WHERE id = ?"
-  )
-    .bind(reviewId)
-    .run();
-
-  const after = await env.DB.prepare(
-    "SELECT COUNT(*) AS count, COALESCE(SUM(overall_rating), 0) AS sum FROM reviews WHERE restaurant_id = ? AND status = 'approved'"
-  )
-    .bind(review.restaurant_id)
-    .first();
-
-  const approvedAfterCount = Number(
-    after?.count || 0
-  );
-
-  const approvedAfterSum = Number(
-    after?.sum || 0
-  );
-
-  const oldCount = Number(
-    restaurant.review_count || 0
-  );
-
-  const oldRating = Number(
-    restaurant.rating || 0
-  );
-
-  const legacyCount = Math.max(
-    oldCount - approvedBeforeCount,
-    0
-  );
-
-  const legacySum = Math.max(
-    oldRating * oldCount - approvedBeforeSum,
-    0
-  );
-
-  const totalCount =
-    legacyCount + approvedAfterCount;
-
-  const totalSum =
-    legacySum + approvedAfterSum;
-
-  const rating =
-    totalCount > 0
-      ? Math.round((totalSum / totalCount) * 10) / 10
-      : 0;
-
-  await env.DB.prepare(
-    "UPDATE restaurants SET rating = ?, review_count = ? WHERE id = ?"
-  )
-    .bind(
-      rating,
-      totalCount,
-      review.restaurant_id
-    )
-    .run();
-
-  return json({
-    ok: true,
-    rating,
-    review_count: totalCount
-  });
-}
-
-
-/* =========================================================
-   REJECT REVIEW
-   ========================================================= */
-
-async function rejectReview(env, reviewId) {
-  if (!Number.isInteger(reviewId) || reviewId <= 0) {
-    return json(
-      {
-        ok: false,
-        error: "Invalid review ID"
-      },
-      400
-    );
-  }
-
-  const review = await env.DB.prepare(
-    "SELECT id, restaurant_id, overall_rating, status FROM reviews WHERE id = ? LIMIT 1"
-  )
-    .bind(reviewId)
-    .first();
-
-  if (!review) {
-    return json(
-      {
-        ok: false,
-        error: "Review not found"
-      },
-      404
-    );
-  }
-
-  const restaurant = await env.DB.prepare(
-    "SELECT id, rating, review_count FROM restaurants WHERE id = ? LIMIT 1"
-  )
-    .bind(review.restaurant_id)
-    .first();
-
-  if (!restaurant) {
-    return json(
-      {
-        ok: false,
-        error: "Restaurant not found"
-      },
-      404
-    );
-  }
-
-  const before = await env.DB.prepare(
-    "SELECT COUNT(*) AS count, COALESCE(SUM(overall_rating), 0) AS sum FROM reviews WHERE restaurant_id = ? AND status = 'approved'"
-  )
-    .bind(review.restaurant_id)
-    .first();
-
-  const approvedBeforeCount = Number(
-    before?.count || 0
-  );
-
-  const approvedBeforeSum = Number(
-    before?.sum || 0
-  );
-
-  await env.DB.prepare(
-    "UPDATE reviews SET status = 'rejected' WHERE id = ?"
-  )
-    .bind(reviewId)
-    .run();
-
-  const after = await env.DB.prepare(
-    "SELECT COUNT(*) AS count, COALESCE(SUM(overall_rating), 0) AS sum FROM reviews WHERE restaurant_id = ? AND status = 'approved'"
-  )
-    .bind(review.restaurant_id)
-    .first();
-
-  const approvedAfterCount = Number(
-    after?.count || 0
-  );
-
-  const approvedAfterSum = Number(
-    after?.sum || 0
-  );
-
-  const oldCount = Number(
-    restaurant.review_count || 0
-  );
-
-  const oldRating = Number(
-    restaurant.rating || 0
-  );
-
-  const legacyCount = Math.max(
-    oldCount - approvedBeforeCount,
-    0
-  );
-
-  const legacySum = Math.max(
-    oldRating * oldCount - approvedBeforeSum,
-    0
-  );
-
-  const totalCount =
-    legacyCount + approvedAfterCount;
-
-  const totalSum =
-    legacySum + approvedAfterSum;
-
-  const rating =
-    totalCount > 0
-      ? Math.round((totalSum / totalCount) * 10) / 10
-      : 0;
-
-  await env.DB.prepare(
-    "UPDATE restaurants SET rating = ?, review_count = ? WHERE id = ?"
-  )
-    .bind(
-      rating,
-      totalCount,
-      review.restaurant_id
-    )
-    .run();
-
-  return json({
-    ok: true,
-    rating,
-    review_count: totalCount
-  });
-}
-
-
-/* =========================================================
-   ADMIN RESTAURANTS
-   ========================================================= */
-
-async function adminGetRestaurants(env) {
-  const result = await env.DB.prepare(
-    "SELECT r.*, c.name AS city_name FROM restaurants r LEFT JOIN cities c ON c.id = r.city_id ORDER BY r.created_at DESC, r.name"
-  ).all();
-
-  const restaurants = result.results || [];
-
-  for (const restaurant of restaurants) {
-    const categories = await env.DB.prepare(
-      "SELECT category FROM restaurant_categories WHERE restaurant_id = ? ORDER BY category"
-    )
-      .bind(restaurant.id)
-      .all();
-
-    restaurant.categories = (categories.results || []).map(
-      function (row) {
-        return row.category;
-      }
-    );
-  }
-
-  return json({
-    ok: true,
-    restaurants
-  });
-}
-
-async function adminCreateRestaurant(env, request) {
-  const body = await parseJson(request);
-
-  const name = cleanText(body.name);
-
-  if (!name) {
-    return json(
-      {
-        ok: false,
-        error: "Restaurant name is required"
-      },
-      400
-    );
-  }
-
-  const slug = await makeUniqueSlug(
-    env,
-    "restaurants",
-    body.slug || name
-  );
-
-  const description = cleanText(body.description);
-  const cityId = nullableInteger(body.city_id);
-  const area = cleanText(body.area);
-  const address = cleanText(body.address);
-  const phone = cleanText(body.phone);
-  const website = safeUrl(body.website);
-  const cuisine = cleanText(body.cuisine);
-  const priceRange = cleanText(body.price_range);
-  const rating = validRatingNumber(body.rating);
-  const reviewCount = validNonNegativeInteger(
-    body.review_count
-  );
-  const featured = body.featured ? 1 : 0;
-  const status = validStatus(
-    body.status,
-    ["published", "draft"]
-  ) || "published";
-
-  await env.DB.prepare(
-    "INSERT INTO restaurants (name, slug, description, city_id, area, address, phone, website, cuisine, price_range, rating, review_count, featured, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-  )
-    .bind(
-      name,
-      slug,
-      description || null,
-      cityId,
-      area || null,
-      address || null,
-      phone || null,
-      website || null,
-      cuisine || null,
-      priceRange || null,
-      rating,
-      reviewCount,
-      featured,
-      status
-    )
-    .run();
-
-  const restaurant = await env.DB.prepare(
-    "SELECT * FROM restaurants WHERE slug = ? LIMIT 1"
-  )
-    .bind(slug)
-    .first();
-
-  await saveRestaurantCategories(
-    env,
-    restaurant.id,
-    body.categories
-  );
-
-  return json({
-    ok: true,
-    restaurant
-  });
-}
-
-async function adminUpdateRestaurant(
-  env,
-  request,
-  id
-) {
-  if (!Number.isInteger(id) || id <= 0) {
-    return json(
-      {
-        ok: false,
-        error: "Invalid restaurant ID"
-      },
-      400
-    );
-  }
-
-  const existing = await env.DB.prepare(
-    "SELECT * FROM restaurants WHERE id = ? LIMIT 1"
-  )
-    .bind(id)
-    .first();
-
-  if (!existing) {
-    return json(
-      {
-        ok: false,
-        error: "Restaurant not found"
-      },
-      404
-    );
-  }
-
-  const body = await parseJson(request);
-
-  const name =
-    cleanText(body.name) || existing.name;
-
-  const slug = await makeUniqueSlug(
-    env,
-    "restaurants",
-    body.slug || name,
-    id
-  );
-
-  const description =
-    cleanText(body.description) ||
-    existing.description ||
-    null;
-
-  const cityId =
-    body.city_id === undefined
-      ? existing.city_id
-      : nullableInteger(body.city_id);
-
-  const area =
-    body.area === undefined
-      ? existing.area
-      : cleanText(body.area);
-
-  const address =
-    body.address === undefined
-      ? existing.address
-      : cleanText(body.address);
-
-  const phone =
-    body.phone === undefined
-      ? existing.phone
-      : cleanText(body.phone);
-
-  const website =
-    body.website === undefined
-      ? existing.website
-      : safeUrl(body.website);
-
-  const cuisine =
-    body.cuisine === undefined
-      ? existing.cuisine
-      : cleanText(body.cuisine);
-
-  const priceRange =
-    body.price_range === undefined
-      ? existing.price_range
-      : cleanText(body.price_range);
-
-  const rating =
-    body.rating === undefined
-      ? Number(existing.rating || 0)
-      : validRatingNumber(body.rating);
-
-  const reviewCount =
-    body.review_count === undefined
-      ? Number(existing.review_count || 0)
-      : validNonNegativeInteger(
-          body.review_count
-        );
-
-  const featured =
-    body.featured === undefined
-      ? Number(existing.featured || 0)
-      : body.featured
-        ? 1
-        : 0;
-
-  const status =
-    validStatus(
-      body.status,
-      ["published", "draft"]
-    ) ||
-    existing.status ||
-    "published";
-
-  await env.DB.prepare(
-    "UPDATE restaurants SET name = ?, slug = ?, description = ?, city_id = ?, area = ?, address = ?, phone = ?, website = ?, cuisine = ?, price_range = ?, rating = ?, review_count = ?, featured = ?, status = ? WHERE id = ?"
-  )
-    .bind(
-      name,
-      slug,
-      description,
-      cityId,
-      area || null,
-      address || null,
-      phone || null,
-      website || null,
-      cuisine || null,
-      priceRange || null,
-      rating,
-      reviewCount,
-      featured,
-      status,
-      id
-    )
-    .run();
-
-  if (body.categories !== undefined) {
-    await saveRestaurantCategories(
-      env,
-      id,
-      body.categories
-    );
-  }
-
-  const restaurant = await env.DB.prepare(
-    "SELECT * FROM restaurants WHERE id = ? LIMIT 1"
-  )
-    .bind(id)
-    .first();
-
-  return json({
-    ok: true,
-    restaurant
-  });
-}
-
-async function adminDeleteRestaurant(env, id) {
-  if (!Number.isInteger(id) || id <= 0) {
-    return json(
-      {
-        ok: false,
-        error: "Invalid restaurant ID"
-      },
-      400
-    );
-  }
-
-  await env.DB.prepare(
-    "DELETE FROM restaurants WHERE id = ?"
-  )
     .bind(id)
     .run();
 
-  return json({
-    ok: true
-  });
-}
+  for (const category of values) {
+    const clean = String(category).trim();
 
-async function saveRestaurantCategories(
-  env,
-  restaurantId,
-  categories
-) {
-  await env.DB.prepare(
-    "DELETE FROM restaurant_categories WHERE restaurant_id = ?"
-  )
-    .bind(restaurantId)
-    .run();
+    if (!clean) continue;
 
-  let list = [];
-
-  if (Array.isArray(categories)) {
-    list = categories;
-  } else if (typeof categories === "string") {
-    list = categories.split(",");
-  }
-
-  list = list
-    .map(function (item) {
-      return cleanText(item);
-    })
-    .filter(Boolean);
-
-  for (const category of list) {
-    await env.DB.prepare(
-      "INSERT INTO restaurant_categories (restaurant_id, category) VALUES (?, ?)"
-    )
-      .bind(restaurantId, category)
+    await env.DB
+      .prepare(
+        `INSERT INTO restaurant_categories
+        (restaurant_id, category)
+        VALUES (?, ?)`
+      )
+      .bind(id, clean)
       .run();
   }
 }
 
+async function replaceRecipeIngredients(env, id, ingredients) {
+  if (!id) return;
 
-/* =========================================================
-   ADMIN CITIES
-   ========================================================= */
-
-async function adminGetCities(env) {
-  const result = await env.DB.prepare(
-    "SELECT * FROM cities ORDER BY name"
-  ).all();
-
-  return json({
-    ok: true,
-    cities: result.results || []
-  });
-}
-
-async function adminCreateCity(env, request) {
-  const body = await parseJson(request);
-
-  const name = cleanText(body.name);
-
-  if (!name) {
-    return json(
-      {
-        ok: false,
-        error: "City name is required"
-      },
-      400
-    );
-  }
-
-  const slug = await makeUniqueSlug(
-    env,
-    "cities",
-    body.slug || name
-  );
-
-  const country =
-    cleanText(body.country) || "Pakistan";
-
-  await env.DB.prepare(
-    "INSERT INTO cities (name, country, slug) VALUES (?, ?, ?)"
-  )
-    .bind(name, country, slug)
-    .run();
-
-  const city = await env.DB.prepare(
-    "SELECT * FROM cities WHERE slug = ? LIMIT 1"
-  )
-    .bind(slug)
-    .first();
-
-  return json({
-    ok: true,
-    city
-  });
-}
-
-
-/* =========================================================
-   ADMIN RECIPES
-   ========================================================= */
-
-async function adminGetRecipes(env) {
-  const result = await env.DB.prepare(
-    "SELECT * FROM recipes ORDER BY created_at DESC, title"
-  ).all();
-
-  const recipes = result.results || [];
-
-  for (const recipe of recipes) {
-    recipe.ingredients = await getRecipeIngredients(
-      env,
-      recipe.id
-    );
-
-    recipe.steps = await getRecipeSteps(
-      env,
-      recipe.id
-    );
-  }
-
-  return json({
-    ok: true,
-    recipes
-  });
-}
-
-async function adminCreateRecipe(env, request) {
-  const body = await parseJson(request);
-
-  const title = cleanText(body.title);
-
-  if (!title) {
-    return json(
-      {
-        ok: false,
-        error: "Recipe title is required"
-      },
-      400
-    );
-  }
-
-  const slug = await makeUniqueSlug(
-    env,
-    "recipes",
-    body.slug || title
-  );
-
-  const description = cleanText(body.description);
-  const category = cleanText(body.category);
-  const cuisine = cleanText(body.cuisine);
-
-  const prepMinutes = validNonNegativeInteger(
-    body.prep_minutes
-  );
-
-  const cookMinutes = validNonNegativeInteger(
-    body.cook_minutes
-  );
-
-  const servings =
-    Math.max(
-      validNonNegativeInteger(body.servings),
-      1
-    );
-
-  const difficulty =
-    cleanText(body.difficulty) || "Easy";
-
-  const rating = validRatingNumber(body.rating);
-
-  const featured = body.featured ? 1 : 0;
-
-  const status =
-    validStatus(
-      body.status,
-      ["published", "draft"]
-    ) || "published";
-
-  await env.DB.prepare(
-    "INSERT INTO recipes (title, slug, description, category, cuisine, prep_minutes, cook_minutes, servings, difficulty, rating, featured, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-  )
-    .bind(
-      title,
-      slug,
-      description || null,
-      category || null,
-      cuisine || null,
-      prepMinutes,
-      cookMinutes,
-      servings,
-      difficulty,
-      rating,
-      featured,
-      status
+  await env.DB
+    .prepare(
+      `DELETE FROM recipe_ingredients
+       WHERE recipe_id = ?`
     )
-    .run();
-
-  const recipe = await env.DB.prepare(
-    "SELECT * FROM recipes WHERE slug = ? LIMIT 1"
-  )
-    .bind(slug)
-    .first();
-
-  await saveRecipeIngredients(
-    env,
-    recipe.id,
-    body.ingredients
-  );
-
-  await saveRecipeSteps(
-    env,
-    recipe.id,
-    body.steps
-  );
-
-  return json({
-    ok: true,
-    recipe
-  });
-}
-
-async function adminUpdateRecipe(
-  env,
-  request,
-  id
-) {
-  if (!Number.isInteger(id) || id <= 0) {
-    return json(
-      {
-        ok: false,
-        error: "Invalid recipe ID"
-      },
-      400
-    );
-  }
-
-  const existing = await env.DB.prepare(
-    "SELECT * FROM recipes WHERE id = ? LIMIT 1"
-  )
-    .bind(id)
-    .first();
-
-  if (!existing) {
-    return json(
-      {
-        ok: false,
-        error: "Recipe not found"
-      },
-      404
-    );
-  }
-
-  const body = await parseJson(request);
-
-  const title =
-    cleanText(body.title) || existing.title;
-
-  const slug = await makeUniqueSlug(
-    env,
-    "recipes",
-    body.slug || title,
-    id
-  );
-
-  const description =
-    body.description === undefined
-      ? existing.description
-      : cleanText(body.description);
-
-  const category =
-    body.category === undefined
-      ? existing.category
-      : cleanText(body.category);
-
-  const cuisine =
-    body.cuisine === undefined
-      ? existing.cuisine
-      : cleanText(body.cuisine);
-
-  const prepMinutes =
-    body.prep_minutes === undefined
-      ? Number(existing.prep_minutes || 0)
-      : validNonNegativeInteger(
-          body.prep_minutes
-        );
-
-  const cookMinutes =
-    body.cook_minutes === undefined
-      ? Number(existing.cook_minutes || 0)
-      : validNonNegativeInteger(
-          body.cook_minutes
-        );
-
-  const servings =
-    body.servings === undefined
-      ? Number(existing.servings || 1)
-      : Math.max(
-          validNonNegativeInteger(body.servings),
-          1
-        );
-
-  const difficulty =
-    body.difficulty === undefined
-      ? existing.difficulty || "Easy"
-      : cleanText(body.difficulty) || "Easy";
-
-  const rating =
-    body.rating === undefined
-      ? Number(existing.rating || 0)
-      : validRatingNumber(body.rating);
-
-  const featured =
-    body.featured === undefined
-      ? Number(existing.featured || 0)
-      : body.featured
-        ? 1
-        : 0;
-
-  const status =
-    validStatus(
-      body.status,
-      ["published", "draft"]
-    ) ||
-    existing.status ||
-    "published";
-
-  await env.DB.prepare(
-    "UPDATE recipes SET title = ?, slug = ?, description = ?, category = ?, cuisine = ?, prep_minutes = ?, cook_minutes = ?, servings = ?, difficulty = ?, rating = ?, featured = ?, status = ? WHERE id = ?"
-  )
-    .bind(
-      title,
-      slug,
-      description || null,
-      category || null,
-      cuisine || null,
-      prepMinutes,
-      cookMinutes,
-      servings,
-      difficulty,
-      rating,
-      featured,
-      status,
-      id
-    )
-    .run();
-
-  if (body.ingredients !== undefined) {
-    await saveRecipeIngredients(
-      env,
-      id,
-      body.ingredients
-    );
-  }
-
-  if (body.steps !== undefined) {
-    await saveRecipeSteps(
-      env,
-      id,
-      body.steps
-    );
-  }
-
-  const recipe = await env.DB.prepare(
-    "SELECT * FROM recipes WHERE id = ? LIMIT 1"
-  )
-    .bind(id)
-    .first();
-
-  return json({
-    ok: true,
-    recipe
-  });
-}
-
-async function adminDeleteRecipe(env, id) {
-  if (!Number.isInteger(id) || id <= 0) {
-    return json(
-      {
-        ok: false,
-        error: "Invalid recipe ID"
-      },
-      400
-    );
-  }
-
-  await env.DB.prepare(
-    "DELETE FROM recipes WHERE id = ?"
-  )
     .bind(id)
     .run();
 
-  return json({
-    ok: true
-  });
-}
-
-async function getRecipeIngredients(
-  env,
-  recipeId
-) {
-  const result = await env.DB.prepare(
-    "SELECT id, ingredient, quantity, sort_order FROM recipe_ingredients WHERE recipe_id = ? ORDER BY sort_order, id"
-  )
-    .bind(recipeId)
-    .all();
-
-  return result.results || [];
-}
-
-async function getRecipeSteps(env, recipeId) {
-  const result = await env.DB.prepare(
-    "SELECT id, step_number, instruction FROM recipe_steps WHERE recipe_id = ? ORDER BY step_number, id"
-  )
-    .bind(recipeId)
-    .all();
-
-  return result.results || [];
-}
-
-async function saveRecipeIngredients(
-  env,
-  recipeId,
-  ingredients
-) {
-  await env.DB.prepare(
-    "DELETE FROM recipe_ingredients WHERE recipe_id = ?"
-  )
-    .bind(recipeId)
-    .run();
-
-  let list = [];
-
-  if (Array.isArray(ingredients)) {
-    list = ingredients;
-  } else if (typeof ingredients === "string") {
-    list = ingredients
-      .split("\n")
-      .map(function (line) {
-        return {
-          ingredient: line,
-          quantity: ""
-        };
-      });
-  }
+  if (!Array.isArray(ingredients)) return;
 
   let order = 0;
 
-  for (const item of list) {
+  for (const item of ingredients) {
     let ingredient = "";
     let quantity = "";
 
     if (typeof item === "string") {
-      ingredient = cleanText(item);
-    } else if (item && typeof item === "object") {
-      ingredient = cleanText(item.ingredient);
-      quantity = cleanText(item.quantity);
+      ingredient = item.trim();
+    } else if (item) {
+      ingredient = String(item.ingredient || "").trim();
+      quantity = String(item.quantity || "").trim();
     }
 
-    if (!ingredient) {
-      continue;
-    }
+    if (!ingredient) continue;
 
-    await env.DB.prepare(
-      "INSERT INTO recipe_ingredients (recipe_id, ingredient, quantity, sort_order) VALUES (?, ?, ?, ?)"
-    )
-      .bind(
-        recipeId,
-        ingredient,
-        quantity || null,
-        order
+    await env.DB
+      .prepare(
+        `INSERT INTO recipe_ingredients
+        (recipe_id, ingredient, quantity, sort_order)
+        VALUES (?, ?, ?, ?)`
       )
+      .bind(id, ingredient, quantity, order)
       .run();
 
     order++;
   }
 }
 
-async function saveRecipeSteps(env, recipeId, steps) {
-  await env.DB.prepare(
-    "DELETE FROM recipe_steps WHERE recipe_id = ?"
-  )
-    .bind(recipeId)
+async function replaceRecipeSteps(env, id, steps) {
+  if (!id) return;
+
+  await env.DB
+    .prepare(
+      `DELETE FROM recipe_steps
+       WHERE recipe_id = ?`
+    )
+    .bind(id)
     .run();
 
-  let list = [];
-
-  if (Array.isArray(steps)) {
-    list = steps;
-  } else if (typeof steps === "string") {
-    list = steps.split("\n");
-  }
+  if (!Array.isArray(steps)) return;
 
   let number = 1;
 
-  for (const item of list) {
+  for (const item of steps) {
     let instruction = "";
 
     if (typeof item === "string") {
-      instruction = cleanText(item);
-    } else if (item && typeof item === "object") {
-      instruction = cleanText(item.instruction);
+      instruction = item.trim();
+    } else if (item) {
+      instruction = String(item.instruction || "").trim();
     }
 
-    if (!instruction) {
-      continue;
-    }
+    if (!instruction) continue;
 
-    await env.DB.prepare(
-      "INSERT INTO recipe_steps (recipe_id, step_number, instruction) VALUES (?, ?, ?)"
-    )
-      .bind(
-        recipeId,
-        number,
-        instruction
+    await env.DB
+      .prepare(
+        `INSERT INTO recipe_steps
+        (recipe_id, step_number, instruction)
+        VALUES (?, ?, ?)`
       )
+      .bind(id, number, instruction)
       .run();
 
     number++;
@@ -2037,1846 +1899,2378 @@ async function saveRecipeSteps(env, recipeId, steps) {
 }
 
 
-/* =========================================================
-   ADMIN STORIES
-   ========================================================= */
+// ================================================================
+// SHARED HTML
+// ================================================================
 
-async function adminGetStories(env) {
-  const result = await env.DB.prepare(
-    "SELECT * FROM food_stories ORDER BY created_at DESC, title"
-  ).all();
+function pageShell(title, content, script = "") {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escapeHtml(title)} | Tastify</title>
 
-  return json({
-    ok: true,
-    stories: result.results || []
-  });
+<style>
+:root{
+  --green:#087f6c;
+  --deep:#075c50;
+  --cream:#fffaf0;
+  --gold:#d8a83e;
+  --orange:#f28c28;
+  --ink:#17332e;
+  --muted:#6c7773;
+  --white:#ffffff;
+  --line:#e5e1d8;
+  --shadow:0 10px 35px rgba(0,0,0,.08);
 }
 
-async function adminCreateStory(env, request) {
-  const body = await parseJson(request);
+*{
+  box-sizing:border-box;
+}
 
-  const title = cleanText(body.title);
-  const content = cleanText(body.content);
+body{
+  margin:0;
+  background:var(--cream);
+  color:var(--ink);
+  font-family:Arial,sans-serif;
+  line-height:1.6;
+}
 
-  if (!title) {
-    return json(
-      {
-        ok: false,
-        error: "Story title is required"
-      },
-      400
-    );
+a{
+  color:inherit;
+  text-decoration:none;
+}
+
+.container{
+  width:min(1180px,92%);
+  margin:auto;
+}
+
+header{
+  background:var(--green);
+  color:white;
+  position:sticky;
+  top:0;
+  z-index:50;
+  box-shadow:0 3px 15px rgba(0,0,0,.12);
+}
+
+.nav{
+  min-height:72px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:20px;
+}
+
+.logo{
+  font-family:Georgia,serif;
+  font-size:29px;
+  font-weight:bold;
+  letter-spacing:.5px;
+}
+
+.logo span{
+  color:#f4d37b;
+}
+
+nav{
+  display:flex;
+  gap:20px;
+  align-items:center;
+  flex-wrap:wrap;
+}
+
+nav a{
+  color:white;
+  font-weight:bold;
+  opacity:.95;
+}
+
+nav a:hover{
+  color:#ffe4a0;
+}
+
+.hero{
+  padding:75px 0;
+  background:
+    radial-gradient(circle at top right,rgba(216,168,62,.25),transparent 35%),
+    linear-gradient(135deg,#075c50,#087f6c);
+  color:white;
+}
+
+.hero h1{
+  font-family:Georgia,serif;
+  font-size:clamp(40px,7vw,72px);
+  line-height:1.05;
+  margin:0 0 18px;
+  max-width:800px;
+}
+
+.hero p{
+  font-size:19px;
+  max-width:720px;
+  opacity:.92;
+}
+
+.searchBox{
+  margin-top:30px;
+  background:white;
+  padding:12px;
+  border-radius:14px;
+  display:flex;
+  gap:10px;
+  box-shadow:var(--shadow);
+  max-width:900px;
+}
+
+.searchBox input,
+.searchBox select{
+  border:1px solid var(--line);
+  padding:14px;
+  border-radius:9px;
+  min-width:0;
+  flex:1;
+  font-size:15px;
+}
+
+button,
+.btn{
+  border:0;
+  background:var(--green);
+  color:white;
+  padding:12px 18px;
+  border-radius:8px;
+  cursor:pointer;
+  font-weight:bold;
+  display:inline-block;
+}
+
+button:hover,
+.btn:hover{
+  background:var(--deep);
+}
+
+.btn.gold{
+  background:var(--gold);
+  color:#2d2411;
+}
+
+.btn.orange{
+  background:var(--orange);
+}
+
+.section{
+  padding:55px 0;
+}
+
+.sectionHead{
+  display:flex;
+  justify-content:space-between;
+  align-items:end;
+  gap:20px;
+  margin-bottom:25px;
+}
+
+.section h2{
+  font-family:Georgia,serif;
+  font-size:34px;
+  margin:0;
+}
+
+.grid{
+  display:grid;
+  grid-template-columns:repeat(3,1fr);
+  gap:22px;
+}
+
+.card{
+  background:white;
+  border:1px solid var(--line);
+  border-radius:15px;
+  overflow:hidden;
+  box-shadow:0 5px 20px rgba(0,0,0,.05);
+}
+
+.cardBody{
+  padding:20px;
+}
+
+.card h3{
+  margin:0 0 8px;
+  font-family:Georgia,serif;
+  font-size:24px;
+}
+
+.meta{
+  color:var(--muted);
+  font-size:14px;
+}
+
+.rating{
+  color:#9a6c00;
+  font-weight:bold;
+}
+
+.cardImage{
+  height:180px;
+  background:linear-gradient(135deg,#087f6c,#d8a83e);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  color:white;
+  font-family:Georgia,serif;
+  font-size:28px;
+}
+
+.tags{
+  display:flex;
+  flex-wrap:wrap;
+  gap:7px;
+  margin:12px 0;
+}
+
+.tag{
+  background:#edf6f3;
+  color:var(--deep);
+  border-radius:20px;
+  padding:5px 10px;
+  font-size:12px;
+  font-weight:bold;
+}
+
+.detail{
+  padding:55px 0;
+}
+
+.detailHero{
+  background:white;
+  border:1px solid var(--line);
+  border-radius:18px;
+  padding:32px;
+  box-shadow:var(--shadow);
+}
+
+.detailHero h1{
+  font-family:Georgia,serif;
+  font-size:45px;
+  line-height:1.1;
+  margin:0 0 12px;
+}
+
+.review{
+  background:white;
+  border:1px solid var(--line);
+  padding:20px;
+  border-radius:12px;
+  margin:15px 0;
+}
+
+form.standard{
+  background:white;
+  border:1px solid var(--line);
+  border-radius:15px;
+  padding:25px;
+}
+
+label{
+  display:block;
+  font-weight:bold;
+  margin:12px 0 6px;
+}
+
+input,
+textarea,
+select{
+  width:100%;
+  padding:12px;
+  border:1px solid #d7d2c7;
+  border-radius:8px;
+  font:inherit;
+}
+
+textarea{
+  min-height:130px;
+  resize:vertical;
+}
+
+.two{
+  display:grid;
+  grid-template-columns:1fr 1fr;
+  gap:18px;
+}
+
+footer{
+  background:#123f37;
+  color:white;
+  padding:40px 0;
+  margin-top:40px;
+}
+
+.notice{
+  background:#fff4cf;
+  border:1px solid #ead08a;
+  padding:15px;
+  border-radius:10px;
+  margin:15px 0;
+}
+
+.empty{
+  padding:35px;
+  background:white;
+  border:1px dashed #cfc8ba;
+  border-radius:12px;
+  text-align:center;
+  color:var(--muted);
+}
+
+.adminWrap{
+  min-height:100vh;
+  background:#f4f1e9;
+}
+
+.adminHeader{
+  background:#075c50;
+  color:white;
+  padding:18px 0;
+}
+
+.adminLayout{
+  display:grid;
+  grid-template-columns:230px 1fr;
+  min-height:calc(100vh - 70px);
+}
+
+.adminSide{
+  background:#123f37;
+  color:white;
+  padding:20px;
+}
+
+.adminSide button{
+  display:block;
+  width:100%;
+  text-align:left;
+  margin:7px 0;
+  background:transparent;
+}
+
+.adminSide button:hover{
+  background:#087f6c;
+}
+
+.adminMain{
+  padding:30px;
+}
+
+.statGrid{
+  display:grid;
+  grid-template-columns:repeat(5,1fr);
+  gap:15px;
+  margin-bottom:25px;
+}
+
+.stat{
+  background:white;
+  border:1px solid var(--line);
+  border-radius:12px;
+  padding:20px;
+}
+
+.stat strong{
+  font-size:32px;
+  display:block;
+  color:var(--green);
+}
+
+.adminPanel{
+  background:white;
+  border:1px solid var(--line);
+  border-radius:14px;
+  padding:22px;
+  margin-bottom:20px;
+}
+
+.adminTable{
+  width:100%;
+  border-collapse:collapse;
+}
+
+.adminTable th,
+.adminTable td{
+  border-bottom:1px solid var(--line);
+  padding:11px;
+  text-align:left;
+  vertical-align:top;
+}
+
+.smallBtn{
+  padding:7px 10px;
+  font-size:12px;
+  margin:2px;
+}
+
+.danger{
+  background:#a33;
+}
+
+.success{
+  background:#28764d;
+}
+
+@media(max-width:850px){
+  .grid{
+    grid-template-columns:1fr 1fr;
   }
 
-  if (!content) {
-    return json(
-      {
-        ok: false,
-        error: "Story content is required"
-      },
-      400
-    );
+  .adminLayout{
+    grid-template-columns:1fr;
   }
 
-  const slug = await makeUniqueSlug(
-    env,
-    "food_stories",
-    body.slug || title
-  );
+  .adminSide{
+    display:flex;
+    overflow:auto;
+    gap:6px;
+  }
 
-  const excerpt =
-    cleanText(body.excerpt) ||
-    makeExcerpt(content, 180);
+  .adminSide button{
+    width:auto;
+    white-space:nowrap;
+  }
 
-  const authorName =
-    cleanText(body.author_name) ||
-    "Tastify";
+  .statGrid{
+    grid-template-columns:repeat(2,1fr);
+  }
+}
 
-  const category = cleanText(body.category);
+@media(max-width:600px){
+  nav{
+    gap:10px;
+    font-size:13px;
+  }
 
-  const featured = body.featured ? 1 : 0;
+  .nav{
+    flex-direction:column;
+    padding:15px 0;
+  }
 
-  const status =
-    validStatus(
-      body.status,
-      ["published", "draft"]
-    ) || "published";
+  .searchBox{
+    flex-direction:column;
+  }
 
-  await env.DB.prepare(
-    "INSERT INTO food_stories (title, slug, excerpt, content, author_name, category, featured, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-  )
-    .bind(
-      title,
-      slug,
-      excerpt || null,
-      content,
-      authorName,
-      category || null,
-      featured,
-      status
+  .grid{
+    grid-template-columns:1fr;
+  }
+
+  .two{
+    grid-template-columns:1fr;
+  }
+
+  .detailHero h1{
+    font-size:34px;
+  }
+
+  .adminMain{
+    padding:15px;
+  }
+
+  .statGrid{
+    grid-template-columns:1fr 1fr;
+  }
+
+  .adminTable{
+    font-size:12px;
+  }
+}
+</style>
+</head>
+
+<body>
+
+<header>
+<div class="container nav">
+<a class="logo" href="/">Tasti<span>fy</span></a>
+
+<nav>
+<a href="/">Home</a>
+<a href="/#restaurants">Restaurants</a>
+<a href="/#recipes">Recipes</a>
+<a href="/#stories">Stories</a>
+<a href="/admin">Admin</a>
+</nav>
+</div>
+</header>
+
+${content}
+
+<footer>
+<div class="container">
+<strong>Tastify</strong>
+<p>In the realms where food and art unite, we aspire to be magicians.</p>
+</div>
+</footer>
+
+${script}
+
+</body>
+</html>`;
+}
+
+
+// ================================================================
+// HOME PAGE
+// ================================================================
+
+async function homePage(url) {
+  const search = url.searchParams.get("search") || "";
+  const city = url.searchParams.get("city") || "";
+
+  const cities = await env.DB
+    .prepare(
+      `SELECT id,name,slug
+       FROM cities
+       ORDER BY name`
     )
-    .run();
-
-  const story = await env.DB.prepare(
-    "SELECT * FROM food_stories WHERE slug = ? LIMIT 1"
-  )
-    .bind(slug)
-    .first();
-
-  return json({
-    ok: true,
-    story
-  });
-}
-
-async function adminUpdateStory(
-  env,
-  request,
-  id
-) {
-  if (!Number.isInteger(id) || id <= 0) {
-    return json(
-      {
-        ok: false,
-        error: "Invalid story ID"
-      },
-      400
-    );
-  }
-
-  const existing = await env.DB.prepare(
-    "SELECT * FROM food_stories WHERE id = ? LIMIT 1"
-  )
-    .bind(id)
-    .first();
-
-  if (!existing) {
-    return json(
-      {
-        ok: false,
-        error: "Story not found"
-      },
-      404
-    );
-  }
-
-  const body = await parseJson(request);
-
-  const title =
-    cleanText(body.title) || existing.title;
-
-  const content =
-    body.content === undefined
-      ? existing.content
-      : cleanText(body.content);
-
-  const slug = await makeUniqueSlug(
-    env,
-    "food_stories",
-    body.slug || title,
-    id
-  );
-
-  const excerpt =
-    body.excerpt === undefined
-      ? existing.excerpt
-      : cleanText(body.excerpt) ||
-        makeExcerpt(content, 180);
-
-  const authorName =
-    body.author_name === undefined
-      ? existing.author_name || "Tastify"
-      : cleanText(body.author_name) ||
-        "Tastify";
-
-  const category =
-    body.category === undefined
-      ? existing.category
-      : cleanText(body.category);
-
-  const featured =
-    body.featured === undefined
-      ? Number(existing.featured || 0)
-      : body.featured
-        ? 1
-        : 0;
-
-  const status =
-    validStatus(
-      body.status,
-      ["published", "draft"]
-    ) ||
-    existing.status ||
-    "published";
-
-  await env.DB.prepare(
-    "UPDATE food_stories SET title = ?, slug = ?, excerpt = ?, content = ?, author_name = ?, category = ?, featured = ?, status = ? WHERE id = ?"
-  )
-    .bind(
-      title,
-      slug,
-      excerpt || null,
-      content,
-      authorName,
-      category || null,
-      featured,
-      status,
-      id
-    )
-    .run();
-
-  const story = await env.DB.prepare(
-    "SELECT * FROM food_stories WHERE id = ? LIMIT 1"
-  )
-    .bind(id)
-    .first();
-
-  return json({
-    ok: true,
-    story
-  });
-}
-
-async function adminDeleteStory(env, id) {
-  if (!Number.isInteger(id) || id <= 0) {
-    return json(
-      {
-        ok: false,
-        error: "Invalid story ID"
-      },
-      400
-    );
-  }
-
-  await env.DB.prepare(
-    "DELETE FROM food_stories WHERE id = ?"
-  )
-    .bind(id)
-    .run();
-
-  return json({
-    ok: true
-  });
-}
-
-
-/* =========================================================
-   PUBLIC RESTAURANT PAGE
-   ========================================================= */
-
-async function restaurantPage(env, slug) {
-  const restaurant = await env.DB.prepare(
-    "SELECT r.*, c.name AS city_name FROM restaurants r LEFT JOIN cities c ON c.id = r.city_id WHERE r.slug = ? AND r.status = 'published' LIMIT 1"
-  )
-    .bind(slug)
-    .first();
-
-  if (!restaurant) {
-    return html(notFoundPage(), 404);
-  }
-
-  const categories = await env.DB.prepare(
-    "SELECT category FROM restaurant_categories WHERE restaurant_id = ? ORDER BY category"
-  )
-    .bind(restaurant.id)
     .all();
 
-  const reviews = await env.DB.prepare(
-    "SELECT author_name, title, body, overall_rating, food_rating, service_rating, atmosphere_rating, value_rating, created_at FROM reviews WHERE restaurant_id = ? AND status = 'approved' ORDER BY created_at DESC"
-  )
-    .bind(restaurant.id)
+  const restaurants = await env.DB
+    .prepare(
+      `SELECT
+        r.*,
+        c.name AS city_name
+       FROM restaurants r
+       LEFT JOIN cities c ON c.id = r.city_id
+       WHERE r.status = 'published'
+       AND r.featured = 1
+       ORDER BY r.rating DESC, r.name
+       LIMIT 6`
+    )
     .all();
 
-  const categoryList =
-    (categories.results || [])
-      .map(function (row) {
-        return row.category;
-      })
-      .join(", ");
-
-  const reviewHtml =
-    (reviews.results || []).length > 0
-      ? (reviews.results || [])
-          .map(function (review) {
-            return (
-              '<article class="review-card">' +
-              '<div class="review-top">' +
-              "<strong>" +
-              escapeHtml(review.author_name) +
-              "</strong>" +
-              "<span>" +
-              escapeHtml(
-                formatRating(review.overall_rating)
-              ) +
-              "</span>" +
-              "</div>" +
-              (review.title
-                ? "<h4>" +
-                  escapeHtml(review.title) +
-                  "</h4>"
-                : "") +
-              "<p>" +
-              escapeHtml(review.body) +
-              "</p>" +
-              '<small>' +
-              escapeHtml(
-                formatDate(review.created_at)
-              ) +
-              "</small>" +
-              "</article>"
-            );
-          })
-          .join("")
-      : '<div class="empty">No approved reviews yet.</div>';
-
-  const content =
-    '<section class="detail-hero">' +
-    '<a class="back-link" href="/">← Back to Tastify</a>' +
-    '<div class="eyebrow">Restaurant Guide</div>' +
-    "<h1>" +
-    escapeHtml(restaurant.name) +
-    "</h1>" +
-    '<div class="rating-big">' +
-    escapeHtml(formatRating(restaurant.rating)) +
-    "</div>" +
-    '<div class="muted">' +
-    escapeHtml(
-      String(restaurant.review_count || 0)
-    ) +
-    " reviews • " +
-    escapeHtml(restaurant.city_name || "") +
-    "</div>" +
-    (categoryList
-      ? '<p class="pill-line">' +
-        escapeHtml(categoryList) +
-        "</p>"
-      : "") +
-    "</section>" +
-
-    '<section class="content-grid">' +
-    '<div class="main-column">' +
-    '<div class="card">' +
-    "<h2>About</h2>" +
-    "<p>" +
-    escapeHtml(
-      restaurant.description ||
-        "Discover this restaurant with Tastify."
-    ) +
-    "</p>" +
-    "</div>" +
-
-    '<div class="card">' +
-    "<h2>Reviews</h2>" +
-    reviewHtml +
-    "</div>" +
-
-    '<div class="card">' +
-    "<h2>Write a Review</h2>" +
-    '<form id="reviewForm">' +
-
-    '<label>Your name</label>' +
-    '<input name="author_name" required>' +
-
-    '<label>Email <span class="muted">(optional)</span></label>' +
-    '<input name="author_email" type="email">' +
-
-    '<label>Review title</label>' +
-    '<input name="title">' +
-
-    '<label>Your review</label>' +
-    '<textarea name="body" rows="6" required></textarea>' +
-
-    '<label>Overall rating</label>' +
-    '<select name="overall_rating" required>' +
-    '<option value="">Choose rating</option>' +
-    '<option value="5">5 — Excellent</option>' +
-    '<option value="4">4 — Very Good</option>' +
-    '<option value="3">3 — Good</option>' +
-    '<option value="2">2 — Fair</option>' +
-    '<option value="1">1 — Poor</option>' +
-    "</select>" +
-
-    '<button class="button" type="submit">Submit Review</button>' +
-    '<div id="reviewMessage"></div>' +
-    "</form>" +
-    "</div>" +
-    "</div>" +
-
-    '<aside class="side-column">' +
-    '<div class="card">' +
-    "<h3>Restaurant Details</h3>" +
-    detailRow("Cuisine", restaurant.cuisine) +
-    detailRow("Price", restaurant.price_range) +
-    detailRow("Area", restaurant.area) +
-    detailRow("Address", restaurant.address) +
-    detailRow("Phone", restaurant.phone) +
-    (restaurant.website
-      ? '<p><a class="button secondary" target="_blank" rel="noopener" href="' +
-        escapeAttribute(
-          safeUrl(restaurant.website)
-        ) +
-        '">Visit Website</a></p>'
-      : "") +
-    "</div>" +
-    "</aside>" +
-    "</section>";
-
-  const script =
-    '<script>' +
-    'document.getElementById("reviewForm").addEventListener("submit", async function(e){' +
-    "e.preventDefault();" +
-    'var form=e.currentTarget;' +
-    'var message=document.getElementById("reviewMessage");' +
-    'var data=Object.fromEntries(new FormData(form).entries());' +
-    'data.overall_rating=Number(data.overall_rating);' +
-    'message.textContent="Submitting...";' +
-    'try{' +
-    'var response=await fetch("/api/restaurants/' +
-    encodeURIComponent(slug) +
-    '/reviews",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});' +
-    'var result=await response.json();' +
-    'if(!response.ok||!result.ok){throw new Error(result.error||"Could not submit review");}' +
-    'message.textContent=result.message||"Review submitted.";form.reset();' +
-    '}catch(error){message.textContent=error.message;}' +
-    "});" +
-    "</script>";
-
-  return html(
-    pageShell(
-      restaurant.name + " | Tastify",
-      content,
-      script
+  const recipes = await env.DB
+    .prepare(
+      `SELECT *
+       FROM recipes
+       WHERE status = 'published'
+       ORDER BY featured DESC, rating DESC, title
+       LIMIT 6`
     )
-  );
-}
+    .all();
 
-
-/* =========================================================
-   PUBLIC RECIPE PAGE
-   ========================================================= */
-
-async function recipePage(env, slug) {
-  const recipe = await env.DB.prepare(
-    "SELECT * FROM recipes WHERE slug = ? AND status = 'published' LIMIT 1"
-  )
-    .bind(slug)
-    .first();
-
-  if (!recipe) {
-    return html(notFoundPage(), 404);
-  }
-
-  const ingredients =
-    await getRecipeIngredients(
-      env,
-      recipe.id
-    );
-
-  const steps =
-    await getRecipeSteps(
-      env,
-      recipe.id
-    );
-
-  const ingredientsHtml =
-    ingredients.length > 0
-      ? "<ul>" +
-        ingredients
-          .map(function (item) {
-            return (
-              "<li>" +
-              (item.quantity
-                ? "<strong>" +
-                  escapeHtml(item.quantity) +
-                  "</strong> "
-                : "") +
-              escapeHtml(item.ingredient) +
-              "</li>"
-            );
-          })
-          .join("") +
-        "</ul>"
-      : '<div class="empty">Ingredients coming soon.</div>';
-
-  const stepsHtml =
-    steps.length > 0
-      ? "<ol>" +
-        steps
-          .map(function (item) {
-            return (
-              "<li>" +
-              escapeHtml(item.instruction) +
-              "</li>"
-            );
-          })
-          .join("") +
-        "</ol>"
-      : '<div class="empty">Recipe steps coming soon.</div>';
-
-  const content =
-    '<section class="detail-hero">' +
-    '<a class="back-link" href="/">← Back to Tastify</a>' +
-    '<div class="eyebrow">Tastify Recipe</div>' +
-    "<h1>" +
-    escapeHtml(recipe.title) +
-    "</h1>" +
-    (recipe.description
-      ? "<p>" +
-        escapeHtml(recipe.description) +
-        "</p>"
-      : "") +
-    '<div class="recipe-meta">' +
-    metaBox("Prep", recipe.prep_minutes + " min") +
-    metaBox("Cook", recipe.cook_minutes + " min") +
-    metaBox("Serves", recipe.servings) +
-    metaBox("Difficulty", recipe.difficulty) +
-    "</div>" +
-    "</section>" +
-
-    '<section class="content-grid">' +
-    '<div class="main-column">' +
-    '<div class="card">' +
-    "<h2>Ingredients</h2>" +
-    ingredientsHtml +
-    "</div>" +
-
-    '<div class="card">' +
-    "<h2>Method</h2>" +
-    stepsHtml +
-    "</div>" +
-    "</div>" +
-
-    '<aside class="side-column">' +
-    '<div class="card">' +
-    detailRow("Cuisine", recipe.cuisine) +
-    detailRow("Category", recipe.category) +
-    detailRow(
-      "Rating",
-      formatRating(recipe.rating)
-    ) +
-    "</div>" +
-    "</aside>" +
-    "</section>";
-
-  return html(
-    pageShell(
-      recipe.title + " | Tastify",
-      content
+  const stories = await env.DB
+    .prepare(
+      `SELECT *
+       FROM food_stories
+       WHERE status = 'published'
+       ORDER BY featured DESC, created_at DESC
+       LIMIT 3`
     )
-  );
-}
-
-
-/* =========================================================
-   PUBLIC STORY PAGE
-   ========================================================= */
-
-async function storyPage(env, slug) {
-  const story = await env.DB.prepare(
-    "SELECT * FROM food_stories WHERE slug = ? AND status = 'published' LIMIT 1"
-  )
-    .bind(slug)
-    .first();
-
-  if (!story) {
-    return html(notFoundPage(), 404);
-  }
-
-  const paragraphs =
-    String(story.content || "")
-      .split(/\n+/)
-      .filter(Boolean)
-      .map(function (paragraph) {
-        return (
-          "<p>" +
-          escapeHtml(paragraph) +
-          "</p>"
-        );
-      })
-      .join("");
-
-  const content =
-    '<article class="story-page">' +
-    '<a class="back-link" href="/">← Back to Tastify</a>' +
-    '<div class="eyebrow">Food Story</div>' +
-    "<h1>" +
-    escapeHtml(story.title) +
-    "</h1>" +
-    (story.excerpt
-      ? '<p class="lead">' +
-        escapeHtml(story.excerpt) +
-        "</p>"
-      : "") +
-    '<div class="story-meta">' +
-    "By " +
-    escapeHtml(story.author_name || "Tastify") +
-    " • " +
-    escapeHtml(formatDate(story.created_at)) +
-    "</div>" +
-    '<div class="story-content">' +
-    paragraphs +
-    "</div>" +
-    "</article>";
-
-  return html(
-    pageShell(
-      story.title + " | Tastify",
-      content
-    )
-  );
-}
-
-
-/* =========================================================
-   HOMEPAGE
-   ========================================================= */
-
-async function homePage(env, url) {
-  const search =
-    (url.searchParams.get("search") || "").trim();
-
-  const city =
-    (url.searchParams.get("city") || "").trim();
-
-  const category =
-    (url.searchParams.get("category") || "").trim();
-
-  const citiesResult = await env.DB.prepare(
-    "SELECT id, name, slug FROM cities ORDER BY name"
-  ).all();
-
-  const cities = citiesResult.results || [];
-
-  let restaurantSql =
-    "SELECT r.id, r.name, r.slug, r.description, r.area, r.cuisine, r.price_range, r.rating, r.review_count, r.featured, c.name AS city_name FROM restaurants r LEFT JOIN cities c ON c.id = r.city_id WHERE r.status = 'published'";
-
-  const restaurantParams = [];
-
-  if (search) {
-    restaurantSql +=
-      " AND (r.name LIKE ? OR r.description LIKE ? OR r.cuisine LIKE ? OR r.area LIKE ?)";
-
-    const term = "%" + search + "%";
-
-    restaurantParams.push(
-      term,
-      term,
-      term,
-      term
-    );
-  }
-
-  if (city) {
-    restaurantSql += " AND c.slug = ?";
-    restaurantParams.push(city);
-  }
-
-  if (category) {
-    restaurantSql +=
-      " AND EXISTS (SELECT 1 FROM restaurant_categories rc WHERE rc.restaurant_id = r.id AND rc.category = ?)";
-
-    restaurantParams.push(category);
-  }
-
-  restaurantSql +=
-    " ORDER BY r.featured DESC, r.rating DESC, r.name LIMIT 12";
-
-  const restaurantsResult =
-    await env.DB.prepare(restaurantSql)
-      .bind(...restaurantParams)
-      .all();
-
-  const restaurants =
-    restaurantsResult.results || [];
-
-  const recipesResult = await env.DB.prepare(
-    "SELECT id, title, slug, description, category, cuisine, prep_minutes, cook_minutes, servings, difficulty, rating FROM recipes WHERE status = 'published' ORDER BY featured DESC, rating DESC, created_at DESC LIMIT 6"
-  ).all();
-
-  const recipes = recipesResult.results || [];
-
-  const storiesResult = await env.DB.prepare(
-    "SELECT id, title, slug, excerpt, author_name, category, created_at FROM food_stories WHERE status = 'published' ORDER BY featured DESC, created_at DESC LIMIT 4"
-  ).all();
-
-  const stories = storiesResult.results || [];
-
-  const cityOptions =
-    '<option value="">All cities</option>' +
-    cities
-      .map(function (item) {
-        return (
-          '<option value="' +
-          escapeAttribute(item.slug) +
-          '"' +
-          (city === item.slug
-            ? " selected"
-            : "") +
-          ">" +
-          escapeHtml(item.name) +
-          "</option>"
-        );
-      })
-      .join("");
+    .all();
 
   const restaurantCards =
-    restaurants.length > 0
-      ? restaurants
-          .map(function (restaurant) {
-            return (
-              '<a class="restaurant-card" href="/restaurant/' +
-              encodeURIComponent(restaurant.slug) +
-              '">' +
-              '<div class="card-image restaurant-art">' +
-              '<span>🍽️</span>' +
-              "</div>" +
-              '<div class="card-body">' +
-              '<div class="eyebrow">' +
-              escapeHtml(
-                restaurant.cuisine ||
-                  "Restaurant"
-              ) +
-              "</div>" +
-              "<h3>" +
-              escapeHtml(restaurant.name) +
-              "</h3>" +
-              '<div class="rating">' +
-              "★ " +
-              escapeHtml(
-                formatRating(restaurant.rating)
-              ) +
-              " · " +
-              escapeHtml(
-                String(
-                  restaurant.review_count || 0
-                )
-              ) +
-              " reviews</div>" +
-              '<p class="muted">' +
-              escapeHtml(
-                [
-                  restaurant.area,
-                  restaurant.city_name
-                ]
-                  .filter(Boolean)
-                  .join(" • ")
-              ) +
-              "</p>" +
-              "</div>" +
-              "</a>"
-            );
-          })
+    (restaurants.results || []).length
+      ? restaurants.results
+          .map(
+            (r) => `
+<div class="card">
+<div class="cardImage">Tastify</div>
+<div class="cardBody">
+<h3>${escapeHtml(r.name)}</h3>
+<div class="meta">${escapeHtml(r.city_name || "")} ${r.area ? "· " + escapeHtml(r.area) : ""}</div>
+<p>${escapeHtml(r.description || "Discover this food destination with Tastify.")}</p>
+<div class="rating">★ ${Number(r.rating || 0).toFixed(1)} · ${Number(r.review_count || 0)} reviews</div>
+<div class="tags">
+${escapeHtml(r.cuisine || "Food")}
+${r.price_range ? `<span class="tag">${escapeHtml(r.price_range)}</span>` : ""}
+</div>
+<a class="btn" href="/restaurant/${encodeURIComponent(r.slug)}">Explore</a>
+</div>
+</div>`
+          )
           .join("")
-      : '<div class="empty wide">No restaurants found yet.</div>';
+      : `<div class="empty">No restaurants have been added yet.</div>`;
 
   const recipeCards =
-    recipes.length > 0
-      ? recipes
-          .map(function (recipe) {
-            return (
-              '<a class="recipe-card" href="/recipe/' +
-              encodeURIComponent(recipe.slug) +
-              '">' +
-              '<div class="card-image recipe-art">' +
-              "<span>🥘</span>" +
-              "</div>" +
-              '<div class="card-body">' +
-              '<div class="eyebrow">' +
-              escapeHtml(
-                recipe.category ||
-                  recipe.cuisine ||
-                  "Recipe"
-              ) +
-              "</div>" +
-              "<h3>" +
-              escapeHtml(recipe.title) +
-              "</h3>" +
-              "<p>" +
-              escapeHtml(
-                recipe.description ||
-                  "An easy Tastify recipe."
-              ) +
-              "</p>" +
-              '<div class="muted">' +
-              escapeHtml(
-                String(recipe.prep_minutes || 0)
-              ) +
-              " min prep • " +
-              escapeHtml(
-                recipe.difficulty || "Easy"
-              ) +
-              "</div>" +
-              "</div>" +
-              "</a>"
-            );
-          })
+    (recipes.results || []).length
+      ? recipes.results
+          .map(
+            (r) => `
+<div class="card">
+<div class="cardImage">Recipe</div>
+<div class="cardBody">
+<h3>${escapeHtml(r.title)}</h3>
+<div class="meta">${escapeHtml(r.cuisine || "")} · ${escapeHtml(r.difficulty || "Easy")}</div>
+<p>${escapeHtml(r.description || "")}</p>
+<div class="rating">★ ${Number(r.rating || 0).toFixed(1)}</div>
+<a class="btn gold" href="/recipe/${encodeURIComponent(r.slug)}">View Recipe</a>
+</div>
+</div>`
+          )
           .join("")
-      : '<div class="empty wide">No recipes added yet.</div>';
+      : `<div class="empty">No recipes have been added yet.</div>`;
 
   const storyCards =
-    stories.length > 0
-      ? stories
-          .map(function (story) {
-            return (
-              '<a class="story-card" href="/story/' +
-              encodeURIComponent(story.slug) +
-              '">' +
-              '<div class="story-icon">✦</div>' +
-              '<div class="card-body">' +
-              '<div class="eyebrow">Food Story</div>' +
-              "<h3>" +
-              escapeHtml(story.title) +
-              "</h3>" +
-              "<p>" +
-              escapeHtml(
-                story.excerpt || ""
-              ) +
-              "</p>" +
-              '<div class="muted">Read story →</div>' +
-              "</div>" +
-              "</a>"
-            );
-          })
+    (stories.results || []).length
+      ? stories.results
+          .map(
+            (s) => `
+<div class="card">
+<div class="cardBody">
+<div class="tag">${escapeHtml(s.category || "Food Story")}</div>
+<h3>${escapeHtml(s.title)}</h3>
+<p>${escapeHtml(s.excerpt || "")}</p>
+<div class="meta">By ${escapeHtml(s.author_name || "Tastify")}</div>
+<br>
+<a class="btn orange" href="/story/${encodeURIComponent(s.slug)}">Read Story</a>
+</div>
+</div>`
+          )
           .join("")
-      : '<div class="empty wide">No food stories added yet.</div>';
+      : `<div class="empty">No food stories have been added yet.</div>`;
 
-  const content =
-    '<section class="hero">' +
-    '<div class="hero-copy">' +
-    '<div class="eyebrow">Discover With Tastify</div>' +
-    "<h1>Where Food<br>Becomes an Experience.</h1>" +
-    "<p>" +
-    "Discover restaurants, cook easy recipes, and explore stories behind the food you love." +
-    "</p>" +
-    "</div>" +
-    '<div class="hero-art">' +
-    '<div class="hero-orb">✦</div>' +
-    "</div>" +
-    "</section>" +
-
-    '<section class="search-panel">' +
-    '<form method="GET" action="/">' +
-    '<input name="search" value="' +
-    escapeAttribute(search) +
-    '" placeholder="Search restaurants, cuisines, recipes...">' +
-    '<select name="city">' +
-    cityOptions +
-    "</select>" +
-    '<input name="category" value="' +
-    escapeAttribute(category) +
-    '" placeholder="Cuisine or category">' +
-    '<button class="button" type="submit">Discover</button>' +
-    "</form>" +
-    "</section>" +
-
-    '<section class="section">' +
-    '<div class="section-heading">' +
-    "<div>" +
-    '<div class="eyebrow">Explore</div>' +
-    "<h2>Restaurants</h2>" +
-    "</div>" +
-    '<a href="/?view=restaurants">View all →</a>' +
-    "</div>" +
-    '<div class="card-grid">' +
-    restaurantCards +
-    "</div>" +
-    "</section>" +
-
-    '<section class="section alternate">' +
-    '<div class="section-heading">' +
-    "<div>" +
-    '<div class="eyebrow">Cook Something</div>' +
-    "<h2>Easy Recipes</h2>" +
-    "</div>" +
-    "</div>" +
-    '<div class="card-grid">' +
-    recipeCards +
-    "</div>" +
-    "</section>" +
-
-    '<section class="section">' +
-    '<div class="section-heading">' +
-    "<div>" +
-    '<div class="eyebrow">The Tastify Journal</div>' +
-    "<h2>Food Stories</h2>" +
-    "</div>" +
-    "</div>" +
-    '<div class="story-grid">' +
-    storyCards +
-    "</div>" +
-    "</section>" +
-
-    '<section class="manifesto">' +
-    "<div>" +
-    '<div class="eyebrow">Our Philosophy</div>' +
-    "<h2>In the realms where food and art unite, we aspire to be magicians.</h2>" +
-    "</div>" +
-    "</section>";
-
-  return html(
-    pageShell(
-      "Tastify — Discover With Tastify",
-      content
+  const cityOptions = (cities.results || [])
+    .map(
+      (c) =>
+        `<option value="${escapeHtml(c.slug)}" ${
+          city === c.slug ? "selected" : ""
+        }>${escapeHtml(c.name)}</option>`
     )
+    .join("");
+
+  const content = `
+<section class="hero">
+<div class="container">
+<h1>Discover With Tastify</h1>
+<p>
+Explore restaurants, discover easy recipes, and enter the realms where food and art unite.
+</p>
+
+<form class="searchBox" method="GET" action="/">
+<input
+name="search"
+placeholder="Search restaurants, cuisines or food..."
+value="${escapeHtml(search)}"
+>
+
+<select name="city">
+<option value="">All cities</option>
+${cityOptions}
+</select>
+
+<button type="submit">Search</button>
+</form>
+</div>
+</section>
+
+<section class="section" id="restaurants">
+<div class="container">
+<div class="sectionHead">
+<h2>Featured Restaurants</h2>
+<a class="btn" href="#restaurants">Discover</a>
+</div>
+
+<div class="grid">
+${restaurantCards}
+</div>
+</div>
+</section>
+
+<section class="section" id="recipes">
+<div class="container">
+<div class="sectionHead">
+<h2>Easy Recipes</h2>
+</div>
+
+<div class="grid">
+${recipeCards}
+</div>
+</div>
+</section>
+
+<section class="section" id="stories">
+<div class="container">
+<div class="sectionHead">
+<h2>Food Stories</h2>
+</div>
+
+<div class="grid">
+${storyCards}
+</div>
+</div>
+</section>
+`;
+
+  return pageShell("Discover With Tastify", content);
+}
+
+
+// ================================================================
+// RESTAURANT PAGE
+// ================================================================
+
+function restaurantPage(restaurant, categories, reviews, photos) {
+  const tags = categories
+    .map((c) => `<span class="tag">${escapeHtml(c.category)}</span>`)
+    .join("");
+
+  const photoBlock = photos.length
+    ? `
+<div class="grid" style="margin-top:25px">
+${photos
+  .map(
+    (p) => `
+<div class="card">
+<img
+src="${escapeHtml(p.image_url)}"
+alt="${escapeHtml(p.caption || restaurant.name)}"
+style="width:100%;height:230px;object-fit:cover"
+>
+</div>`
+  )
+  .join("")}
+</div>`
+    : "";
+
+  const reviewBlock = reviews.length
+    ? reviews
+        .map(
+          (r) => `
+<div class="review">
+<strong>${escapeHtml(r.author_name)}</strong>
+<div class="rating">★ ${Number(r.overall_rating).toFixed(0)}/5</div>
+${r.title ? `<h3>${escapeHtml(r.title)}</h3>` : ""}
+<p>${escapeHtml(r.body)}</p>
+<div class="meta">${escapeHtml(r.created_at || "")}</div>
+</div>`
+        )
+        .join("")
+    : `<div class="empty">No approved reviews yet. Be the first to share your experience.</div>`;
+
+  const content = `
+<section class="detail">
+<div class="container">
+
+<div class="detailHero">
+
+<div class="tag">
+${escapeHtml(restaurant.cuisine || "Restaurant")}
+</div>
+
+<h1>${escapeHtml(restaurant.name)}</h1>
+
+<div class="rating">
+★ ${Number(restaurant.rating || 0).toFixed(1)}
+· ${Number(restaurant.review_count || 0)} reviews
+</div>
+
+<p>${escapeHtml(restaurant.description || "")}</p>
+
+<div class="tags">
+${tags}
+${restaurant.price_range ? `<span class="tag">${escapeHtml(restaurant.price_range)}</span>` : ""}
+</div>
+
+<p>
+<strong>Location:</strong>
+${escapeHtml(restaurant.city_name || "")}
+${restaurant.area ? " · " + escapeHtml(restaurant.area) : ""}
+${restaurant.address ? " · " + escapeHtml(restaurant.address) : ""}
+</p>
+
+${
+  restaurant.phone
+    ? `<p><strong>Phone:</strong> ${escapeHtml(restaurant.phone)}</p>`
+    : ""
+}
+
+${
+  restaurant.website
+    ? `<p><a class="btn" href="${escapeHtml(restaurant.website)}" target="_blank" rel="noopener">Visit Website</a></p>`
+    : ""
+}
+
+</div>
+
+${photoBlock}
+
+<div style="margin-top:35px">
+<h2>Reviews</h2>
+${reviewBlock}
+</div>
+
+<div style="margin-top:35px">
+<h2>Write a Review</h2>
+
+<form class="standard" id="reviewForm">
+
+<label>Your Name</label>
+<input name="author_name" required>
+
+<label>Email</label>
+<input name="author_email" type="email">
+
+<label>Review Title</label>
+<input name="title">
+
+<label>Overall Rating</label>
+<select name="overall_rating" required>
+<option value="">Select rating</option>
+<option value="5">5 - Excellent</option>
+<option value="4">4 - Very Good</option>
+<option value="3">3 - Good</option>
+<option value="2">2 - Fair</option>
+<option value="1">1 - Poor</option>
+</select>
+
+<label>Your Review</label>
+<textarea name="body" required></textarea>
+
+<button type="submit">Submit Review</button>
+
+<div id="reviewMessage"></div>
+
+</form>
+</div>
+
+</div>
+</section>
+`;
+
+  const script = `
+<script>
+document.getElementById("reviewForm").addEventListener("submit",async function(e){
+e.preventDefault();
+
+var form=e.target;
+var data=Object.fromEntries(new FormData(form).entries());
+data.overall_rating=Number(data.overall_rating);
+
+var message=document.getElementById("reviewMessage");
+
+try{
+var response=await fetch("/api/restaurants/${encodeURIComponent(
+    restaurant.slug
+  )}/reviews",{
+method:"POST",
+headers:{"content-type":"application/json"},
+body:JSON.stringify(data)
+});
+
+var result=await response.json();
+
+if(!response.ok){
+throw new Error(result.error || "Unable to submit review");
+}
+
+message.className="notice";
+message.textContent=result.message;
+form.reset();
+
+}catch(error){
+message.className="notice";
+message.textContent=error.message;
+}
+});
+</script>
+`;
+
+  return pageShell(
+    restaurant.name,
+    content,
+    script
   );
 }
 
 
-/* =========================================================
-   ADMIN LOGIN PAGE
-   ========================================================= */
+// ================================================================
+// RECIPE PAGE
+// ================================================================
 
-function loginPage() {
-  return (
-    '<!DOCTYPE html>' +
-    '<html lang="en">' +
-    "<head>" +
-    '<meta charset="UTF-8">' +
-    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
-    "<title>Tastify Admin Login</title>" +
-    adminStyles() +
-    "</head>" +
-    "<body>" +
-    '<main class="login-wrap">' +
-    '<div class="login-card">' +
-    '<div class="brand">Tastify<span>✦</span></div>' +
-    '<div class="eyebrow">Administration</div>' +
-    "<h1>Welcome Back</h1>" +
-    "<p>Sign in to manage your Tastify content.</p>" +
-    '<form id="loginForm">' +
-    '<label>Admin Password</label>' +
-    '<input type="password" name="password" required autofocus>' +
-    '<button class="button" type="submit">Sign In</button>' +
-    '<div id="loginMessage"></div>' +
-    "</form>" +
-    '<a class="back-link" href="/">← Back to Tastify</a>' +
-    "</div>" +
-    "</main>" +
+function recipePage(recipe, ingredients, steps) {
+  const ingredientHtml = ingredients.length
+    ? `<ul>${ingredients
+        .map(
+          (i) =>
+            `<li><strong>${escapeHtml(i.quantity || "")}</strong> ${escapeHtml(i.ingredient)}</li>`
+        )
+        .join("")}</ul>`
+    : `<div class="empty">Ingredients have not been added yet.</div>`;
 
-    "<script>" +
-    'document.getElementById("loginForm").addEventListener("submit",async function(e){' +
-    "e.preventDefault();" +
-    'var form=e.currentTarget;' +
-    'var message=document.getElementById("loginMessage");' +
-    'var password=form.elements.password.value;' +
-    'message.textContent="Signing in...";' +
-    'try{' +
-    'var response=await fetch("/admin/login",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:password})});' +
-    'var data=await response.json();' +
-    'if(!response.ok||!data.ok){throw new Error(data.error||"Login failed");}' +
-    'window.location.href="/admin";' +
-    '}catch(error){message.textContent=error.message;}' +
-    "});" +
-    "</script>" +
+  const stepsHtml = steps.length
+    ? `<ol>${steps
+        .map(
+          (s) =>
+            `<li style="margin-bottom:12px">${escapeHtml(s.instruction)}</li>`
+        )
+        .join("")}</ol>`
+    : `<div class="empty">Recipe steps have not been added yet.</div>`;
 
-    "</body>" +
-    "</html>"
+  const content = `
+<section class="detail">
+<div class="container">
+
+<div class="detailHero">
+
+<div class="tag">
+${escapeHtml(recipe.category || "Recipe")}
+</div>
+
+<h1>${escapeHtml(recipe.title)}</h1>
+
+<p>${escapeHtml(recipe.description || "")}</p>
+
+<div class="tags">
+<span class="tag">${escapeHtml(recipe.cuisine || "Home Cooking")}</span>
+<span class="tag">${escapeHtml(recipe.difficulty || "Easy")}</span>
+<span class="tag">${recipe.prep_minutes || 0} min prep</span>
+<span class="tag">${recipe.cook_minutes || 0} min cook</span>
+<span class="tag">${recipe.servings || 1} servings</span>
+</div>
+
+<div class="rating">
+★ ${Number(recipe.rating || 0).toFixed(1)}
+</div>
+
+</div>
+
+<div class="two" style="margin-top:25px">
+
+<div class="card">
+<div class="cardBody">
+<h2>Ingredients</h2>
+${ingredientHtml}
+</div>
+</div>
+
+<div class="card">
+<div class="cardBody">
+<h2>Method</h2>
+${stepsHtml}
+</div>
+</div>
+
+</div>
+
+</div>
+</section>
+`;
+
+  return pageShell(recipe.title, content);
+}
+
+
+// ================================================================
+// STORY PAGE
+// ================================================================
+
+function storyPage(story) {
+  const content = `
+<section class="detail">
+<div class="container">
+
+<article class="detailHero">
+
+<div class="tag">
+${escapeHtml(story.category || "Food Story")}
+</div>
+
+<h1>${escapeHtml(story.title)}</h1>
+
+<p class="meta">
+By ${escapeHtml(story.author_name || "Tastify")}
+</p>
+
+${
+  story.excerpt
+    ? `<p><strong>${escapeHtml(story.excerpt)}</strong></p>`
+    : ""
+}
+
+<div style="margin-top:30px;white-space:pre-wrap">
+${escapeHtml(story.content)}
+</div>
+
+</article>
+
+</div>
+</section>
+`;
+
+  return pageShell(story.title, content);
+}
+
+
+// ================================================================
+// NOT FOUND
+// ================================================================
+
+function notFoundPage(message) {
+  return pageShell(
+    "Not Found",
+    `
+<section class="section">
+<div class="container">
+<div class="empty">
+<h1>${escapeHtml(message)}</h1>
+<a class="btn" href="/">Return Home</a>
+</div>
+</div>
+</section>
+`
   );
 }
 
 
-/* =========================================================
-   ADMIN DASHBOARD
-   ========================================================= */
+// ================================================================
+// ADMIN LOGIN PAGE
+// ================================================================
+
+function adminLoginPage() {
+  return pageShell(
+    "Admin Login",
+    `
+<section class="section">
+<div class="container" style="max-width:500px">
+
+<form class="standard" id="loginForm">
+
+<h1 style="font-family:Georgia,serif">
+Tastify Admin
+</h1>
+
+<p>
+Sign in to manage restaurants, recipes, food stories and reviews.
+</p>
+
+<label>Admin Password</label>
+<input
+type="password"
+name="password"
+required
+autocomplete="current-password"
+>
+
+<button type="submit">Sign In</button>
+
+<div id="loginMessage"></div>
+
+</form>
+
+</div>
+</section>
+`,
+    `
+<script>
+document.getElementById("loginForm").addEventListener("submit",async function(e){
+e.preventDefault();
+
+var password=e.target.password.value;
+var message=document.getElementById("loginMessage");
+
+try{
+var response=await fetch("/admin/login",{
+method:"POST",
+headers:{"content-type":"application/json"},
+body:JSON.stringify({password:password})
+});
+
+var result=await response.json();
+
+if(!response.ok){
+throw new Error(result.error || "Login failed");
+}
+
+location.href="/admin";
+
+}catch(error){
+message.className="notice";
+message.textContent=error.message;
+}
+});
+</script>
+`
+  );
+}
+
+
+// ================================================================
+// ADMIN DASHBOARD
+// ================================================================
 
 function adminDashboard() {
-  /*
-    IMPORTANT:
-    There are deliberately NO nested JavaScript template
-    literals inside this page. This prevents the
-    "Unexpected token '<'" build/runtime problem that
-    occurred in the previous version.
-  */
+  const content = `
+<div class="adminWrap">
 
-  const content =
-    '<div class="admin-layout">' +
+<div class="adminHeader">
+<div class="container nav">
+<div>
+<strong style="font-family:Georgia,serif;font-size:25px">
+Tastify Admin
+</strong>
+</div>
 
-    '<aside class="admin-sidebar">' +
-    '<div class="brand">Tastify<span>✦</span></div>' +
-    '<div class="admin-label">ADMINISTRATION</div>' +
+<div>
+<a href="/" style="color:white;margin-right:15px">View Site</a>
+<button id="logoutBtn">Logout</button>
+</div>
+</div>
+</div>
 
-    '<button class="nav-btn active" data-section="dashboard">Dashboard</button>' +
-    '<button class="nav-btn" data-section="restaurants">Restaurants</button>' +
-    '<button class="nav-btn" data-section="recipes">Recipes</button>' +
-    '<button class="nav-btn" data-section="stories">Food Stories</button>' +
-    '<button class="nav-btn" data-section="reviews">Reviews</button>' +
-    '<button class="nav-btn" data-section="cities">Cities</button>' +
+<div class="adminLayout">
 
-    '<div class="sidebar-bottom">' +
-    '<a href="/" target="_blank">View Website ↗</a>' +
-    '<button id="logoutBtn">Log Out</button>' +
-    "</div>" +
-    "</aside>" +
+<aside class="adminSide">
 
-    '<main class="admin-main">' +
+<button onclick="showPanel('dashboard')">Dashboard</button>
+<button onclick="showPanel('restaurants')">Restaurants</button>
+<button onclick="showPanel('restaurantForm')">Add Restaurant</button>
+<button onclick="showPanel('recipes')">Recipes</button>
+<button onclick="showPanel('recipeForm')">Add Recipe</button>
+<button onclick="showPanel('stories')">Food Stories</button>
+<button onclick="showPanel('storyForm')">Add Story</button>
+<button onclick="showPanel('reviews')">Reviews</button>
+<button onclick="showPanel('cities')">Cities</button>
 
-    '<header class="admin-top">' +
-    '<div>' +
-    '<div class="eyebrow">Tastify Control Center</div>' +
-    '<h1 id="pageTitle">Dashboard</h1>' +
-    "</div>" +
-    '<button class="mobile-menu" id="mobileMenu">☰</button>' +
-    "</header>" +
+</aside>
 
-    '<div id="adminMessage"></div>' +
+<main class="adminMain">
 
-    '<section id="section-dashboard" class="admin-section active">' +
-    '<div class="stats-grid">' +
-    statCard("restaurantsStat", "Restaurants", "🍽️") +
-    statCard("recipesStat", "Recipes", "🥘") +
-    statCard("storiesStat", "Stories", "📖") +
-    statCard("pendingStat", "Pending Reviews", "★") +
-    statCard("citiesStat", "Cities", "⌖") +
-    "</div>" +
+<div id="dashboard" class="adminPanel">
+<h1>Dashboard</h1>
 
-    '<div class="dashboard-grid">' +
-    '<div class="panel">' +
-    '<div class="panel-heading"><h2>Quick Actions</h2></div>' +
-    '<div class="quick-actions">' +
-    '<button class="action-card" data-action="restaurant">＋<strong>Add Restaurant</strong><span>Create a restaurant profile</span></button>' +
-    '<button class="action-card" data-action="recipe">＋<strong>Add Recipe</strong><span>Add ingredients and method</span></button>' +
-    '<button class="action-card" data-action="story">＋<strong>Add Food Story</strong><span>Publish a story</span></button>' +
-    '<button class="action-card" data-action="city">＋<strong>Add City</strong><span>Add a destination</span></button>' +
-    "</div>" +
-    "</div>" +
+<div class="statGrid">
 
-    '<div class="panel">' +
-    '<div class="panel-heading"><h2>Review Moderation</h2><button class="text-btn" data-section-link="reviews">Manage →</button></div>' +
-    '<div id="dashboardReviews"></div>' +
-    "</div>" +
-    "</div>" +
-    "</section>" +
+<div class="stat">
+<span>Restaurants</span>
+<strong id="statRestaurants">0</strong>
+</div>
 
-    '<section id="section-restaurants" class="admin-section">' +
-    sectionHeader(
-      "Restaurants",
-      "Add and manage restaurant listings.",
-      "addRestaurantBtn"
-    ) +
-    '<div id="restaurantsTable" class="table-wrap"></div>' +
-    "</section>" +
+<div class="stat">
+<span>Recipes</span>
+<strong id="statRecipes">0</strong>
+</div>
 
-    '<section id="section-recipes" class="admin-section">' +
-    sectionHeader(
-      "Recipes",
-      "Manage recipes, ingredients and cooking steps.",
-      "addRecipeBtn"
-    ) +
-    '<div id="recipesTable" class="table-wrap"></div>' +
-    "</section>" +
+<div class="stat">
+<span>Stories</span>
+<strong id="statStories">0</strong>
+</div>
 
-    '<section id="section-stories" class="admin-section">' +
-    sectionHeader(
-      "Food Stories",
-      "Publish stories and food culture content.",
-      "addStoryBtn"
-    ) +
-    '<div id="storiesTable" class="table-wrap"></div>' +
-    "</section>" +
+<div class="stat">
+<span>Pending Reviews</span>
+<strong id="statReviews">0</strong>
+</div>
 
-    '<section id="section-reviews" class="admin-section">' +
-    '<div class="section-head"><div><h2>Review Moderation</h2><p>Approve or reject submitted reviews.</p></div></div>' +
-    '<div class="filter-row">' +
-    '<button class="filter-btn active" data-review-filter="pending">Pending</button>' +
-    '<button class="filter-btn" data-review-filter="approved">Approved</button>' +
-    '<button class="filter-btn" data-review-filter="rejected">Rejected</button>' +
-    '<button class="filter-btn" data-review-filter="all">All</button>' +
-    "</div>" +
-    '<div id="reviewsTable" class="review-list"></div>' +
-    "</section>" +
+<div class="stat">
+<span>Cities</span>
+<strong id="statCities">0</strong>
+</div>
 
-    '<section id="section-cities" class="admin-section">' +
-    sectionHeader(
-      "Cities",
-      "Manage the cities available in your restaurant directory.",
-      "addCityBtn"
-    ) +
-    '<div id="citiesTable" class="table-wrap"></div>' +
-    "</section>" +
+</div>
 
-    "</main>" +
-    "</div>" +
+<div class="notice">
+Use the menu on the left to add and manage Tastify content.
+</div>
+</div>
 
-    '<div id="modal" class="modal hidden">' +
-    '<div class="modal-backdrop"></div>' +
-    '<div class="modal-card">' +
-    '<button class="modal-close" id="modalClose">×</button>' +
-    '<div id="modalContent"></div>' +
-    "</div>" +
-    "</div>";
 
-  const script =
-    "<script>" +
+<div id="restaurants" class="adminPanel" style="display:none">
+<h2>Restaurants</h2>
+<div id="restaurantList"></div>
+</div>
 
-    "var state={" +
-    'restaurants:[],' +
-    'recipes:[],' +
-    'stories:[],' +
-    'cities:[],' +
-    'reviews:[]' +
-    "};" +
 
-    "function showMessage(text,isError){" +
-    'var el=document.getElementById("adminMessage");' +
-    'el.textContent=text||"";' +
-    'el.className=isError?"admin-error":"admin-success";' +
-    'if(text){setTimeout(function(){el.textContent="";el.className="";},3500);}' +
-    "}" +
+<div id="restaurantForm" class="adminPanel" style="display:none">
 
-    "async function api(url,options){" +
-    "options=options||{};" +
-    'var response=await fetch(url,options);' +
-    'var text=await response.text();' +
-    "var data;" +
-    "try{data=JSON.parse(text);}catch(error){" +
-    'throw new Error("Server returned an unexpected response.");' +
-    "}" +
-    'if(!response.ok||!data.ok){throw new Error(data.error||"Request failed");}' +
-    "return data;" +
-    "}" +
+<h2 id="restaurantFormTitle">Add Restaurant</h2>
 
-    "function switchSection(section){" +
-    'document.querySelectorAll(".admin-section").forEach(function(el){el.classList.remove("active");});' +
-    'var target=document.getElementById("section-"+section);' +
-    "if(target){target.classList.add(\"active\");}" +
-    'document.querySelectorAll(".nav-btn").forEach(function(btn){btn.classList.toggle("active",btn.getAttribute("data-section")===section);});' +
-    'var titles={dashboard:"Dashboard",restaurants:"Restaurants",recipes:"Recipes",stories:"Food Stories",reviews:"Reviews",cities:"Cities"};' +
-    'document.getElementById("pageTitle").textContent=titles[section]||"Dashboard";' +
-    "if(section==='restaurants'){loadRestaurants();}" +
-    "if(section==='recipes'){loadRecipes();}" +
-    "if(section==='stories'){loadStories();}" +
-    "if(section==='reviews'){loadReviews('pending');}" +
-    "if(section==='cities'){loadCities();}" +
-    "}" +
+<form id="restaurantEditor">
 
-    'document.querySelectorAll(".nav-btn").forEach(function(btn){btn.addEventListener("click",function(){switchSection(btn.getAttribute("data-section"));});});' +
+<input type="hidden" name="id">
 
-    'document.querySelectorAll("[data-section-link]").forEach(function(btn){btn.addEventListener("click",function(){switchSection(btn.getAttribute("data-section-link"));});});' +
+<label>Name</label>
+<input name="name" required>
 
-    'document.querySelectorAll("[data-action]").forEach(function(btn){btn.addEventListener("click",function(){var action=btn.getAttribute("data-action");if(action==="restaurant"){openRestaurantForm();}if(action==="recipe"){openRecipeForm();}if(action==="story"){openStoryForm();}if(action==="city"){openCityForm();}});});' +
+<label>Slug</label>
+<input name="slug" placeholder="Leave blank to generate automatically">
 
-    'document.getElementById("addRestaurantBtn").addEventListener("click",openRestaurantForm);' +
-    'document.getElementById("addRecipeBtn").addEventListener("click",openRecipeForm);' +
-    'document.getElementById("addStoryBtn").addEventListener("click",openStoryForm);' +
-    'document.getElementById("addCityBtn").addEventListener("click",openCityForm);' +
+<label>Description</label>
+<textarea name="description"></textarea>
 
-    'document.getElementById("modalClose").addEventListener("click",closeModal);' +
-    'document.querySelector(".modal-backdrop").addEventListener("click",closeModal);' +
+<div class="two">
 
-    'document.getElementById("logoutBtn").addEventListener("click",async function(){try{await api("/admin/logout",{method:"POST"});window.location.href="/admin";}catch(error){showMessage(error.message,true);}});' +
+<div>
+<label>City</label>
+<select name="city_id" id="restaurantCity"></select>
+</div>
 
-    'document.getElementById("mobileMenu").addEventListener("click",function(){document.querySelector(".admin-sidebar").classList.toggle("open");});' +
+<div>
+<label>Area</label>
+<input name="area">
+</div>
 
-    'document.querySelectorAll("[data-review-filter]").forEach(function(btn){btn.addEventListener("click",function(){document.querySelectorAll("[data-review-filter]").forEach(function(b){b.classList.remove("active");});btn.classList.add("active");loadReviews(btn.getAttribute("data-review-filter"));});});' +
+</div>
 
-    "function openModal(content){" +
-    'document.getElementById("modalContent").innerHTML=content;' +
-    'document.getElementById("modal").classList.remove("hidden");' +
-    "}" +
+<label>Address</label>
+<input name="address">
 
-    "function closeModal(){" +
-    'document.getElementById("modal").classList.add("hidden");' +
-    'document.getElementById("modalContent").innerHTML="";' +
-    "}" +
+<div class="two">
 
-    "async function loadDashboard(){" +
-    "try{" +
-    'var data=await api("/api/admin/stats");' +
-    'document.getElementById("restaurantsStat").textContent=data.stats.restaurants;' +
-    'document.getElementById("recipesStat").textContent=data.stats.recipes;' +
-    'document.getElementById("storiesStat").textContent=data.stats.stories;' +
-    'document.getElementById("pendingStat").textContent=data.stats.pending_reviews;' +
-    'document.getElementById("citiesStat").textContent=data.stats.cities;' +
-    "await loadDashboardReviews();" +
-    "}catch(error){showMessage(error.message,true);}" +
-    "}" +
+<div>
+<label>Phone</label>
+<input name="phone">
+</div>
 
-    "async function loadDashboardReviews(){" +
-    "try{" +
-    'var data=await api("/api/admin/reviews?status=pending");' +
-    'var reviews=data.reviews.slice(0,5);' +
-    'var el=document.getElementById("dashboardReviews");' +
-    "if(!reviews.length){el.innerHTML='<div class=\"empty\">No pending reviews.</div>';return;}" +
-    'el.innerHTML=reviews.map(function(review){return "<div class=\\"mini-review\\"><strong>"+esc(review.author_name)+"</strong><span>"+esc(review.restaurant_name)+"</span><span>"+stars(review.overall_rating)+"</span></div>";}).join("");' +
-    "}catch(error){document.getElementById("dashboardReviews").innerHTML='<div class="empty">Unable to load reviews.</div>';}" +
-    "}" +
+<div>
+<label>Website</label>
+<input name="website" placeholder="https://example.com">
+</div>
 
-    "async function loadRestaurants(){" +
-    "try{" +
-    'var data=await api("/api/admin/restaurants");' +
-    'state.restaurants=data.restaurants;' +
-    'renderRestaurants();' +
-    "}catch(error){showMessage(error.message,true);}" +
-    "}" +
+</div>
 
-    "function renderRestaurants(){" +
-    'var el=document.getElementById("restaurantsTable");' +
-    "if(!state.restaurants.length){el.innerHTML='<div class=\"empty wide\">No restaurants yet. Click Add Restaurant to create one.</div>';return;}" +
-    'el.innerHTML="<table><thead><tr><th>Name</th><th>City</th><th>Cuisine</th><th>Rating</th><th>Status</th><th>Actions</th></tr></thead><tbody>"+state.restaurants.map(function(r){return "<tr><td><strong>"+esc(r.name)+"</strong><small>"+esc(r.slug)+"</small></td><td>"+esc(r.city_name||"—")+"</td><td>"+esc(r.cuisine||"—")+"</td><td>★ "+esc(r.rating)+"</td><td><span class=\\"status\\">"+esc(r.status)+"</span></td><td><button class=\\"small-btn\\" onclick=\\"editRestaurant("+r.id+")\\">Edit</button> <button class=\\"small-btn danger\\" onclick=\\"deleteRestaurant("+r.id+")\\">Delete</button></td></tr>";}).join("")+"</tbody></table>";' +
-    "}" +
+<div class="two">
 
-    "window.editRestaurant=function(id){var r=state.restaurants.find(function(x){return x.id===id;});if(r){openRestaurantForm(r);}};" +
+<div>
+<label>Cuisine</label>
+<input name="cuisine" placeholder="Italian, Burgers, Asian">
+</div>
 
-    "window.deleteRestaurant=async function(id){" +
-    'if(!confirm("Delete this restaurant? This will also remove its reviews and categories.")){return;}' +
-    "try{await api('/api/admin/restaurants/'+id,{method:'DELETE'});showMessage('Restaurant deleted.');loadRestaurants();loadDashboard();}catch(error){showMessage(error.message,true);}" +
-    "};" +
+<div>
+<label>Price Range</label>
+<input name="price_range" placeholder="$, $$, $$$">
+</div>
 
-    "async function loadCities(){" +
-    "try{" +
-    'var data=await api("/api/admin/cities");' +
-    'state.cities=data.cities;' +
-    'renderCities();' +
-    "}catch(error){showMessage(error.message,true);}" +
-    "}" +
+</div>
 
-    "function renderCities(){" +
-    'var el=document.getElementById("citiesTable");' +
-    "if(!state.cities.length){el.innerHTML='<div class=\"empty wide\">No cities yet.</div>';return;}" +
-    'el.innerHTML="<table><thead><tr><th>City</th><th>Country</th><th>Slug</th></tr></thead><tbody>"+state.cities.map(function(c){return "<tr><td><strong>"+esc(c.name)+"</strong></td><td>"+esc(c.country)+"</td><td>"+esc(c.slug)+"</td></tr>";}).join("")+"</tbody></table>";' +
-    "}" +
+<div class="two">
 
-    "async function loadRecipes(){" +
-    "try{" +
-    'var data=await api("/api/admin/recipes");' +
-    'state.recipes=data.recipes;' +
-    'renderRecipes();' +
-    "}catch(error){showMessage(error.message,true);}" +
-    "}" +
+<div>
+<label>Rating</label>
+<input name="rating" type="number" min="0" max="5" step="0.1" value="0">
+</div>
 
-    "function renderRecipes(){" +
-    'var el=document.getElementById("recipesTable");' +
-    "if(!state.recipes.length){el.innerHTML='<div class=\"empty wide\">No recipes yet. Click Add Recipe to create one.</div>';return;}" +
-    'el.innerHTML="<table><thead><tr><th>Recipe</th><th>Cuisine</th><th>Difficulty</th><th>Rating</th><th>Status</th><th>Actions</th></tr></thead><tbody>"+state.recipes.map(function(r){return "<tr><td><strong>"+esc(r.title)+"</strong><small>"+esc(r.slug)+"</small></td><td>"+esc(r.cuisine||"—")+"</td><td>"+esc(r.difficulty||"Easy")+"</td><td>★ "+esc(r.rating)+"</td><td><span class=\\"status\\">"+esc(r.status)+"</span></td><td><button class=\\"small-btn\\" onclick=\\"editRecipe("+r.id+")\\">Edit</button> <button class=\\"small-btn danger\\" onclick=\\"deleteRecipe("+r.id+")\\">Delete</button></td></tr>";}).join("")+"</tbody></table>";' +
-    "}" +
+<div>
+<label>Review Count</label>
+<input name="review_count" type="number" min="0" value="0">
+</div>
 
-    "window.editRecipe=function(id){var r=state.recipes.find(function(x){return x.id===id;});if(r){openRecipeForm(r);}};" +
+</div>
 
-    "window.deleteRecipe=async function(id){" +
-    'if(!confirm("Delete this recipe?")){return;}' +
-    "try{await api('/api/admin/recipes/'+id,{method:'DELETE'});showMessage('Recipe deleted.');loadRecipes();loadDashboard();}catch(error){showMessage(error.message,true);}" +
-    "};" +
+<label>Categories</label>
+<input name="categories" placeholder="Pizza, Pasta, Italian">
 
-    "async function loadStories(){" +
-    "try{" +
-    'var data=await api("/api/admin/stories");' +
-    'state.stories=data.stories;' +
-    'renderStories();' +
-    "}catch(error){showMessage(error.message,true);}" +
-    "}" +
+<label>
+<input name="featured" type="checkbox" style="width:auto">
+ Featured
+</label>
 
-    "function renderStories(){" +
-    'var el=document.getElementById("storiesTable");' +
-    "if(!state.stories.length){el.innerHTML='<div class=\"empty wide\">No food stories yet. Click Add Food Story.</div>';return;}" +
-    'el.innerHTML="<table><thead><tr><th>Title</th><th>Author</th><th>Category</th><th>Status</th><th>Actions</th></tr></thead><tbody>"+state.stories.map(function(s){return "<tr><td><strong>"+esc(s.title)+"</strong><small>"+esc(s.slug)+"</small></td><td>"+esc(s.author_name||"Tastify")+"</td><td>"+esc(s.category||"—")+"</td><td><span class=\\"status\\">"+esc(s.status)+"</span></td><td><button class=\\"small-btn\\" onclick=\\"editStory("+s.id+")\\">Edit</button> <button class=\\"small-btn danger\\" onclick=\\"deleteStory("+s.id+")\\">Delete</button></td></tr>";}).join("")+"</tbody></table>";' +
-    "}" +
+<label>Status</label>
+<select name="status">
+<option value="published">Published</option>
+<option value="draft">Draft</option>
+</select>
 
-    "window.editStory=function(id){var s=state.stories.find(function(x){return x.id===id;});if(s){openStoryForm(s);}};" +
+<br>
 
-    "window.deleteStory=async function(id){" +
-    'if(!confirm("Delete this story?")){return;}' +
-    "try{await api('/api/admin/stories/'+id,{method:'DELETE'});showMessage('Story deleted.');loadStories();loadDashboard();}catch(error){showMessage(error.message,true);}" +
-    "};" +
+<button type="submit">Save Restaurant</button>
+<button type="button" class="gold" onclick="resetRestaurantForm()">Clear</button>
 
-    "async function loadReviews(status){" +
-    "try{" +
-    'var url="/api/admin/reviews";' +
-    'if(status&&status!=="all"){url+="?status="+encodeURIComponent(status);}' +
-    'var data=await api(url);' +
-    'state.reviews=data.reviews;' +
-    'renderReviews();' +
-    "}catch(error){showMessage(error.message,true);}" +
-    "}" +
+<div id="restaurantMessage"></div>
 
-    "function renderReviews(){" +
-    'var el=document.getElementById("reviewsTable");' +
-    "if(!state.reviews.length){el.innerHTML='<div class=\"empty wide\">No reviews found.</div>';return;}" +
-    'el.innerHTML=state.reviews.map(function(r){return "<article class=\\"admin-review\\"><div class=\\"review-header\\"><div><strong>"+esc(r.author_name)+"</strong><span>"+esc(r.restaurant_name)+"</span></div><div class=\\"review-rating\\">"+stars(r.overall_rating)+"</div></div>"+(r.title?"<h3>"+esc(r.title)+"</h3>":"")+"<p>"+esc(r.body)+"</p><div class=\\"review-footer\\"><span class=\\"status\\">"+esc(r.status)+"</span><small>"+esc(formatDate(r.created_at))+"</small><div>"+(r.status!=="approved"?'<button class="small-btn success" onclick="approveReview('+r.id+')">Approve</button>':"")+(r.status!=="rejected"?'<button class="small-btn danger" onclick="rejectReview('+r.id+')">Reject</button>':"")+"</div></div></article>";}).join("");' +
-    "}" +
+</form>
+</div>
 
-    "window.approveReview=async function(id){" +
-    "try{await api('/api/admin/reviews/'+id+'/approve',{method:'POST'});showMessage('Review approved.');loadReviews('pending');loadDashboard();}catch(error){showMessage(error.message,true);}" +
-    "};" +
 
-    "window.rejectReview=async function(id){" +
-    "try{await api('/api/admin/reviews/'+id+'/reject',{method:'POST'});showMessage('Review rejected.');loadReviews('pending');loadDashboard();}catch(error){showMessage(error.message,true);}" +
-    "};" +
+<div id="recipes" class="adminPanel" style="display:none">
+<h2>Recipes</h2>
+<div id="recipeList"></div>
+</div>
 
-    "function openRestaurantForm(item){" +
-    "item=item||{};" +
-    'var editing=Boolean(item.id);' +
-    'var cityOptions="<option value=\\"\\">Select city</option>"+state.cities.map(function(c){return "<option value=\\""+c.id+"\\""+(Number(item.city_id)===Number(c.id)?" selected":"")+">"+esc(c.name)+"</option>";}).join("");' +
-    'var categories=Array.isArray(item.categories)?item.categories.join(", "):"";' +
-    'openModal("<div class=\\"modal-heading\\"><div class=\\"eyebrow\\">Restaurant</div><h2>"+(editing?"Edit Restaurant":"Add Restaurant")+"</h2></div><form id=\\"restaurantForm\\"><div class=\\"form-grid\\"><label>Name<input name=\\"name\\" required value=\\""+attr(item.name||"")+"\\"></label><label>Slug<input name=\\"slug\\" value=\\""+attr(item.slug||"")+"\\"><small>Leave blank to generate automatically.</small></label><label>City<select name=\\"city_id\\">"+cityOptions+"</select></label><label>Area<input name=\\"area\\" value=\\""+attr(item.area||"")+"\\"></label><label>Address<input name=\\"address\\" value=\\""+attr(item.address||"")+"\\"></label><label>Phone<input name=\\"phone\\" value=\\""+attr(item.phone||"")+"\\"></label><label>Website<input name=\\"website\\" value=\\""+attr(item.website||"")+"\\"></label><label>Cuisine<input name=\\"cuisine\\" placeholder=\\"Italian, Burgers, Asian...\\" value=\\""+attr(item.cuisine||"")+"\\"></label><label>Price Range<input name=\\"price_range\\" placeholder=\\"$, $$, $$$\\" value=\\""+attr(item.price_range||"")+"\\"></label><label>Rating<input name=\\"rating\\" type=\\"number\\" min=\\"0\\" max=\\"5\\" step=\\"0.1\\" value=\\""+attr(item.rating||0)+"\\"></label><label>Review Count<input name=\\"review_count\\" type=\\"number\\" min=\\"0\\" value=\\""+attr(item.review_count||0)+"\\"></label><label>Categories<input name=\\"categories\\" placeholder=\\"Pizza, Pasta, Italian\\" value=\\""+attr(categories)+"\\"></label><label>Status<select name=\\"status\\"><option value=\\"published\\""+(item.status!=="draft"?" selected":"")+">Published</option><option value=\\"draft\\""+(item.status==="draft"?" selected":"")+">Draft</option></select></label></div><label>Description<textarea name=\\"description\\" rows=\\"5\\">"+esc(item.description||"")+"</textarea></label><label class=\\"check\\"><input type=\\"checkbox\\" name=\\"featured\\""+(item.featured?" checked":"")+"> Featured restaurant</label><button class=\\"button\\" type=\\"submit\\">"+(editing?"Save Changes":"Create Restaurant")+"</button></form>");' +
-    'document.getElementById("restaurantForm").addEventListener("submit",async function(e){e.preventDefault();var f=e.currentTarget;var data=Object.fromEntries(new FormData(f).entries());data.city_id=data.city_id?Number(data.city_id):null;data.rating=Number(data.rating||0);data.review_count=Number(data.review_count||0);data.featured=f.elements.featured.checked;data.categories=data.categories.split(",").map(function(x){return x.trim();}).filter(Boolean);try{await api(editing?"/api/admin/restaurants/"+item.id:"/api/admin/restaurants",{method:editing?"PUT":"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});closeModal();showMessage(editing?"Restaurant updated.":"Restaurant created.");loadRestaurants();loadDashboard();}catch(error){showMessage(error.message,true);}});' +
-    "if(!state.cities.length){loadCities();}" +
-    "}" +
 
-    "function openCityForm(){" +
-    'openModal("<div class=\\"modal-heading\\"><div class=\\"eyebrow\\">Directory</div><h2>Add City</h2></div><form id=\\"cityForm\\"><label>City Name<input name=\\"name\\" required></label><label>Country<input name=\\"country\\" value=\\"Pakistan\\"></label><label>Slug<input name=\\"slug\\" placeholder=\\"Leave blank to generate\\"></label><button class=\\"button\\" type=\\"submit\\">Create City</button></form>");' +
-    'document.getElementById("cityForm").addEventListener("submit",async function(e){e.preventDefault();var data=Object.fromEntries(new FormData(e.currentTarget).entries());try{await api("/api/admin/cities",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});closeModal();showMessage("City created.");loadCities();loadDashboard();}catch(error){showMessage(error.message,true);}});' +
-    "}" +
+<div id="recipeForm" class="adminPanel" style="display:none">
 
-    "function openRecipeForm(item){" +
-    "item=item||{};" +
-    'var editing=Boolean(item.id);' +
-    'var ingredients=Array.isArray(item.ingredients)?item.ingredients.map(function(x){return (x.quantity?x.quantity+" ":"")+x.ingredient;}).join("\\n"):"";' +
-    'var steps=Array.isArray(item.steps)?item.steps.map(function(x){return x.instruction;}).join("\\n"):"";' +
-    'openModal("<div class=\\"modal-heading\\"><div class=\\"eyebrow\\">Kitchen</div><h2>"+(editing?"Edit Recipe":"Add Recipe")+"</h2></div><form id=\\"recipeForm\\"><div class=\\"form-grid\\"><label>Title<input name=\\"title\\" required value=\\""+attr(item.title||"")+"\\"></label><label>Slug<input name=\\"slug\\" value=\\""+attr(item.slug||"")+"\\"></label><label>Category<input name=\\"category\\" value=\\""+attr(item.category||"")+"\\"></label><label>Cuisine<input name=\\"cuisine\\" value=\\""+attr(item.cuisine||"")+"\\"></label><label>Prep Minutes<input name=\\"prep_minutes\\" type=\\"number\\" min=\\"0\\" value=\\""+attr(item.prep_minutes||0)+"\\"></label><label>Cook Minutes<input name=\\"cook_minutes\\" type=\\"number\\" min=\\"0\\" value=\\""+attr(item.cook_minutes||0)+"\\"></label><label>Servings<input name=\\"servings\\" type=\\"number\\" min=\\"1\\" value=\\""+attr(item.servings||1)+"\\"></label><label>Difficulty<select name=\\"difficulty\\"><option"+(item.difficulty==="Easy"||!item.difficulty?" selected":"")+">Easy</option><option"+(item.difficulty==="Medium"?" selected":"")+">Medium</option><option"+(item.difficulty==="Hard"?" selected":"")+">Hard</option></select></label><label>Rating<input name=\\"rating\\" type=\\"number\\" min=\\"0\\" max=\\"5\\" step=\\"0.1\\" value=\\""+attr(item.rating||0)+"\\"></label><label>Status<select name=\\"status\\"><option value=\\"published\\""+(item.status!=="draft"?" selected":"")+">Published</option><option value=\\"draft\\""+(item.status==="draft"?" selected":"")+">Draft</option></select></label></div><label>Description<textarea name=\\"description\\" rows=\\"4\\">"+esc(item.description||"")+"</textarea></label><label>Ingredients <small>One ingredient per line. You can include quantity at the beginning.</small><textarea name=\\"ingredients\\" rows=\\"8\\" placeholder=\\"500 g chicken\\n1 onion\\n2 cloves garlic\\">"+esc(ingredients)+"</textarea></label><label>Method / Steps <small>One step per line.</small><textarea name=\\"steps\\" rows=\\"8\\" placeholder=\\"Prepare the ingredients.\\nCook until golden.\\nServe hot.\\">"+esc(steps)+"</textarea></label><label class=\\"check\\"><input type=\\"checkbox\\" name=\\"featured\\""+(item.featured?" checked":"")+"> Featured recipe</label><button class=\\"button\\" type=\\"submit\\">"+(editing?"Save Changes":"Create Recipe")+"</button></form>");' +
-    'document.getElementById("recipeForm").addEventListener("submit",async function(e){e.preventDefault();var f=e.currentTarget;var data=Object.fromEntries(new FormData(f).entries());data.prep_minutes=Number(data.prep_minutes||0);data.cook_minutes=Number(data.cook_minutes||0);data.servings=Number(data.servings||1);data.rating=Number(data.rating||0);data.featured=f.elements.featured.checked;data.ingredients=data.ingredients.split("\\n").map(function(x){return x.trim();}).filter(Boolean);data.steps=data.steps.split("\\n").map(function(x){return x.trim();}).filter(Boolean);try{await api(editing?"/api/admin/recipes/"+item.id:"/api/admin/recipes",{method:editing?"PUT":"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});closeModal();showMessage(editing?"Recipe updated.":"Recipe created.");loadRecipes();loadDashboard();}catch(error){showMessage(error.message,true);}});' +
-    "}" +
+<h2>Recipe Editor</h2>
 
-    "function openStoryForm(item){" +
-    "item=item||{};" +
-    'var editing=Boolean(item.id);' +
-    'openModal("<div class=\\"modal-heading\\"><div class=\\"eyebrow\\">Journal</div><h2>"+(editing?"Edit Food Story":"Add Food Story")+"</h2></div><form id=\\"storyForm\\"><label>Title<input name=\\"title\\" required value=\\""+attr(item.title||"")+"\\"></label><label>Slug<input name=\\"slug\\" value=\\""+attr(item.slug||"")+"\\"></label><div class=\\"form-grid\\"><label>Author<input name=\\"author_name\\" value=\\""+attr(item.author_name||"Tastify")+"\\"></label><label>Category<input name=\\"category\\" value=\\""+attr(item.category||"")+"\\"></label><label>Status<select name=\\"status\\"><option value=\\"published\\""+(item.status!=="draft"?" selected":"")+">Published</option><option value=\\"draft\\""+(item.status==="draft"?" selected":"")+">Draft</option></select></label></div><label>Excerpt<textarea name=\\"excerpt\\" rows=\\"3\\">"+esc(item.excerpt||"")+"</textarea></label><label>Content<textarea name=\\"content\\" rows=\\"14\\" required>"+esc(item.content||"")+"</textarea></label><label class=\\"check\\"><input type=\\"checkbox\\" name=\\"featured\\""+(item.featured?" checked":"")+"> Featured story</label><button class=\\"button\\" type=\\"submit\\">"+(editing?"Save Changes":"Publish Story")+"</button></form>");' +
-    'document.getElementById("storyForm").addEventListener("submit",async function(e){e.preventDefault();var f=e.currentTarget;var data=Object.fromEntries(new FormData(f).entries());data.featured=f.elements.featured.checked;try{await api(editing?"/api/admin/stories/"+item.id:"/api/admin/stories",{method:editing?"PUT":"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});closeModal();showMessage(editing?"Story updated.":"Story created.");loadStories();loadDashboard();}catch(error){showMessage(error.message,true);}});' +
-    "}" +
+<form id="recipeEditor">
 
-    "function esc(value){" +
-    'return String(value==null?"":value).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/\\x27/g,"&#039;");' +
-    "}" +
+<input type="hidden" name="id">
 
-    "function attr(value){return esc(value);}" +
+<label>Title</label>
+<input name="title" required>
 
-    "function stars(value){return '★'.repeat(Math.max(0,Math.min(5,Number(value)||0)));}" +
+<label>Slug</label>
+<input name="slug" placeholder="Leave blank to generate automatically">
 
-    "function formatDate(value){if(!value){return '';}try{return new Date(value.replace(' ','T')+'Z').toLocaleDateString();}catch(error){return value;}}" +
+<label>Description</label>
+<textarea name="description"></textarea>
 
-    "loadDashboard();" +
-    "loadCities();" +
+<div class="two">
 
-    "</script>";
+<div>
+<label>Category</label>
+<input name="category" placeholder="Breakfast, Dinner, Dessert">
+</div>
 
-  return (
-    "<!DOCTYPE html>" +
-    '<html lang="en">' +
-    "<head>" +
-    '<meta charset="UTF-8">' +
-    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
-    "<title>Tastify Admin</title>" +
-    adminStyles() +
-    "</head>" +
-    "<body>" +
-    content +
-    script +
-    "</body>" +
-    "</html>"
-  );
+<div>
+<label>Cuisine</label>
+<input name="cuisine" placeholder="Italian, Pakistani, Mexican">
+</div>
+
+</div>
+
+<div class="two">
+
+<div>
+<label>Prep Minutes</label>
+<input name="prep_minutes" type="number" min="0" value="0">
+</div>
+
+<div>
+<label>Cook Minutes</label>
+<input name="cook_minutes" type="number" min="0" value="0">
+</div>
+
+</div>
+
+<div class="two">
+
+<div>
+<label>Servings</label>
+<input name="servings" type="number" min="1" value="1">
+</div>
+
+<div>
+<label>Difficulty</label>
+<select name="difficulty">
+<option>Easy</option>
+<option>Medium</option>
+<option>Hard</option>
+</select>
+</div>
+
+</div>
+
+<label>Rating</label>
+<input name="rating" type="number" min="0" max="5" step="0.1" value="0">
+
+<label>Ingredients</label>
+
+<div id="ingredientRows"></div>
+
+<button type="button" onclick="addIngredientRow()">
++ Add Ingredient
+</button>
+
+<label>Steps</label>
+
+<div id="stepRows"></div>
+
+<button type="button" onclick="addStepRow()">
++ Add Step
+</button>
+
+<br><br>
+
+<label>
+<input name="featured" type="checkbox" style="width:auto">
+ Featured
+</label>
+
+<label>Status</label>
+<select name="status">
+<option value="published">Published</option>
+<option value="draft">Draft</option>
+</select>
+
+<br>
+
+<button type="submit">Save Recipe</button>
+<button type="button" class="gold" onclick="resetRecipeForm()">Clear</button>
+
+<div id="recipeMessage"></div>
+
+</form>
+</div>
+
+
+<div id="stories" class="adminPanel" style="display:none">
+<h2>Food Stories</h2>
+<div id="storyList"></div>
+</div>
+
+
+<div id="storyForm" class="adminPanel" style="display:none">
+
+<h2>Story Editor</h2>
+
+<form id="storyEditor">
+
+<input type="hidden" name="id">
+
+<label>Title</label>
+<input name="title" required>
+
+<label>Slug</label>
+<input name="slug" placeholder="Leave blank to generate automatically">
+
+<label>Excerpt</label>
+<textarea name="excerpt"></textarea>
+
+<label>Content</label>
+<textarea name="content" style="min-height:300px" required></textarea>
+
+<div class="two">
+
+<div>
+<label>Author</label>
+<input name="author_name" value="Tastify">
+</div>
+
+<div>
+<label>Category</label>
+<input name="category" placeholder="Food Culture">
+</div>
+
+</div>
+
+<label>
+<input name="featured" type="checkbox" style="width:auto">
+ Featured
+</label>
+
+<label>Status</label>
+<select name="status">
+<option value="published">Published</option>
+<option value="draft">Draft</option>
+</select>
+
+<br>
+
+<button type="submit">Save Story</button>
+<button type="button" class="gold" onclick="resetStoryForm()">Clear</button>
+
+<div id="storyMessage"></div>
+
+</form>
+</div>
+
+
+<div id="reviews" class="adminPanel" style="display:none">
+
+<h2>Review Moderation</h2>
+
+<select id="reviewStatus" onchange="loadReviews()">
+<option value="pending">Pending</option>
+<option value="approved">Approved</option>
+<option value="rejected">Rejected</option>
+<option value="all">All</option>
+</select>
+
+<div id="reviewList"></div>
+
+</div>
+
+
+<div id="cities" class="adminPanel" style="display:none">
+
+<h2>Cities</h2>
+
+<form id="cityEditor">
+
+<div class="two">
+
+<div>
+<label>City Name</label>
+<input name="name" required>
+</div>
+
+<div>
+<label>Country</label>
+<input name="country" value="Pakistan">
+</div>
+
+</div>
+
+<br>
+
+<button type="submit">Add City</button>
+
+</form>
+
+<div id="cityList"></div>
+
+</div>
+
+</main>
+</div>
+</div>
+`;
+
+  const script = `
+<script>
+
+var restaurants=[];
+var recipes=[];
+var stories=[];
+var cities=[];
+
+function showPanel(id){
+
+var panels=[
+"dashboard",
+"restaurants",
+"restaurantForm",
+"recipes",
+"recipeForm",
+"stories",
+"storyForm",
+"reviews",
+"cities"
+];
+
+panels.forEach(function(x){
+var el=document.getElementById(x);
+if(el) el.style.display=x===id?"block":"none";
+});
+
+if(id==="dashboard") loadStats();
+if(id==="restaurants") loadRestaurants();
+if(id==="recipes") loadRecipes();
+if(id==="stories") loadStories();
+if(id==="reviews") loadReviews();
+if(id==="cities") loadCities();
+
+}
+
+async function api(url,options){
+
+var response=await fetch(url,options||{});
+
+var text=await response.text();
+
+var data;
+
+try{
+data=JSON.parse(text);
+}catch(error){
+throw new Error(
+"Server returned HTML instead of JSON. Check the Worker API route."
+);
+}
+
+if(!response.ok){
+throw new Error(data.error||"Request failed");
+}
+
+return data;
+
 }
 
 
-/* =========================================================
-   ADMIN UI HELPERS
-   ========================================================= */
+// ------------------------------------------------------------
+// LOGOUT
+// ------------------------------------------------------------
 
-function statCard(id, label, icon) {
-  return (
-    '<div class="stat-card">' +
-    '<div class="stat-icon">' +
-    icon +
-    "</div>" +
-    '<div class="stat-number" id="' +
-    id +
-    '">0</div>' +
-    '<div class="stat-label">' +
-    escapeHtml(label) +
-    "</div>" +
-    "</div>"
-  );
+document.getElementById("logoutBtn").addEventListener("click",async function(){
+
+await fetch("/admin/logout",{method:"POST"});
+
+location.href="/admin";
+
+});
+
+
+// ------------------------------------------------------------
+// STATS
+// ------------------------------------------------------------
+
+async function loadStats(){
+
+try{
+
+var data=await api("/api/admin/stats");
+
+document.getElementById("statRestaurants").textContent=data.restaurants;
+document.getElementById("statRecipes").textContent=data.recipes;
+document.getElementById("statStories").textContent=data.stories;
+document.getElementById("statReviews").textContent=data.pending_reviews;
+document.getElementById("statCities").textContent=data.cities;
+
+}catch(error){
+console.error(error);
 }
 
-function sectionHeader(
-  title,
-  description,
-  buttonId
-) {
-  return (
-    '<div class="section-head">' +
-    "<div>" +
-    "<h2>" +
-    escapeHtml(title) +
-    "</h2>" +
-    "<p>" +
-    escapeHtml(description) +
-    "</p>" +
-    "</div>" +
-    '<button class="button" id="' +
-    buttonId +
-    '">＋ Add</button>' +
-    "</div>"
-  );
 }
 
 
-/* =========================================================
-   GLOBAL PAGE SHELL
-   ========================================================= */
+// ------------------------------------------------------------
+// CITIES
+// ------------------------------------------------------------
 
-function pageShell(title, content, extraScript) {
-  return (
-    "<!DOCTYPE html>" +
-    '<html lang="en">' +
-    "<head>" +
-    '<meta charset="UTF-8">' +
-    '<meta name="viewport" content="width=device-width,initial-scale=1">' +
-    "<title>" +
-    escapeHtml(title) +
-    "</title>" +
-    publicStyles() +
-    "</head>" +
-    "<body>" +
-    '<nav class="site-nav">' +
-    '<a class="brand" href="/">Tastify<span>✦</span></a>' +
-    '<div class="nav-links">' +
-    '<a href="/">Home</a>' +
-    '<a href="/?view=restaurants">Restaurants</a>' +
-    '<a href="/?view=recipes">Recipes</a>' +
-    '<a href="/?view=stories">Stories</a>' +
-    '<a href="/admin">Admin</a>' +
-    "</div>" +
-    "</nav>" +
-    '<main class="site-main">' +
-    content +
-    "</main>" +
-    '<footer class="site-footer">' +
-    '<div class="brand">Tastify<span>✦</span></div>' +
-    "<p>Discover With Tastify.</p>" +
-    "</footer>" +
-    (extraScript || "") +
-    "</body>" +
-    "</html>"
-  );
+async function loadCities(){
+
+try{
+
+var data=await api("/api/admin/cities");
+
+cities=data.cities||[];
+
+var select=document.getElementById("restaurantCity");
+
+select.innerHTML='<option value="">Select city</option>';
+
+cities.forEach(function(city){
+
+select.innerHTML+=
+'<option value="'+city.id+'">'+escapeClient(city.name)+'</option>';
+
+});
+
+var list=document.getElementById("cityList");
+
+if(!cities.length){
+list.innerHTML='<div class="empty">No cities yet.</div>';
+return;
+}
+
+list.innerHTML=
+'<table class="adminTable">'+
+'<tr><th>City</th><th>Country</th></tr>'+
+cities.map(function(city){
+return '<tr>'+
+'<td>'+escapeClient(city.name)+'</td>'+
+'<td>'+escapeClient(city.country)+'</td>'+
+'</tr>';
+}).join("")+
+'</table>';
+
+}catch(error){
+
+document.getElementById("cityList").innerHTML=
+'<div class="notice">'+escapeClient(error.message)+'</div>';
+
+}
+
+}
+
+document.getElementById("cityEditor").addEventListener("submit",async function(e){
+
+e.preventDefault();
+
+var data=Object.fromEntries(new FormData(e.target).entries());
+
+try{
+
+await api("/api/admin/cities",{
+method:"POST",
+headers:{"content-type":"application/json"},
+body:JSON.stringify(data)
+});
+
+e.target.reset();
+await loadCities();
+await loadStats();
+
+alert("City added successfully.");
+
+}catch(error){
+alert(error.message);
+}
+
+});
+
+
+// ------------------------------------------------------------
+// RESTAURANTS
+// ------------------------------------------------------------
+
+async function loadRestaurants(){
+
+var box=document.getElementById("restaurantList");
+
+try{
+
+var data=await api("/api/admin/restaurants");
+
+restaurants=data.restaurants||[];
+
+if(!restaurants.length){
+box.innerHTML='<div class="empty">No restaurants yet. Use Add Restaurant.</div>';
+return;
+}
+
+box.innerHTML=
+'<table class="adminTable">'+
+'<tr>'+
+'<th>Name</th>'+
+'<th>City</th>'+
+'<th>Rating</th>'+
+'<th>Status</th>'+
+'<th>Actions</th>'+
+'</tr>'+
+restaurants.map(function(r){
+
+return '<tr>'+
+'<td><strong>'+escapeClient(r.name)+'</strong><br><span class="meta">'+escapeClient(r.cuisine||"")+'</span></td>'+
+'<td>'+escapeClient(r.city_name||"")+'</td>'+
+'<td>★ '+Number(r.rating||0).toFixed(1)+'<br>'+Number(r.review_count||0)+' reviews</td>'+
+'<td>'+escapeClient(r.status)+'</td>'+
+'<td>'+
+'<button class="smallBtn" onclick="editRestaurant('+r.id+')">Edit</button>'+
+'<button class="smallBtn danger" onclick="deleteRestaurant('+r.id+')">Delete</button>'+
+'</td>'+
+'</tr>';
+
+}).join("")+
+'</table>';
+
+}catch(error){
+
+box.innerHTML=
+'<div class="notice">'+escapeClient(error.message)+'</div>';
+
+}
+
+}
+
+function resetRestaurantForm(){
+
+var form=document.getElementById("restaurantEditor");
+
+form.reset();
+
+form.elements.id.value="";
+
+document.getElementById("restaurantFormTitle").textContent="Add Restaurant";
+
+}
+
+function editRestaurant(id){
+
+var r=restaurants.find(function(x){
+return Number(x.id)===Number(id);
+});
+
+if(!r) return;
+
+var form=document.getElementById("restaurantEditor");
+
+form.elements.id.value=r.id;
+form.elements.name.value=r.name||"";
+form.elements.slug.value=r.slug||"";
+form.elements.description.value=r.description||"";
+form.elements.city_id.value=r.city_id||"";
+form.elements.area.value=r.area||"";
+form.elements.address.value=r.address||"";
+form.elements.phone.value=r.phone||"";
+form.elements.website.value=r.website||"";
+form.elements.cuisine.value=r.cuisine||"";
+form.elements.price_range.value=r.price_range||"";
+form.elements.rating.value=r.rating||0;
+form.elements.review_count.value=r.review_count||0;
+form.elements.featured.checked=Boolean(r.featured);
+form.elements.status.value=r.status||"published";
+
+document.getElementById("restaurantFormTitle").textContent="Edit Restaurant";
+
+showPanel("restaurantForm");
+
+}
+
+document.getElementById("restaurantEditor").addEventListener("submit",async function(e){
+
+e.preventDefault();
+
+var form=e.target;
+var data=Object.fromEntries(new FormData(form).entries());
+
+data.city_id=data.city_id||null;
+data.rating=Number(data.rating||0);
+data.review_count=Number(data.review_count||0);
+data.featured=form.elements.featured.checked;
+data.categories=String(data.categories||"")
+.split(",")
+.map(function(x){return x.trim();})
+.filter(Boolean);
+
+var id=data.id;
+
+delete data.id;
+
+try{
+
+await api(
+id
+?"/api/admin/restaurants/"+id
+:"/api/admin/restaurants",
+{
+method:id?"PUT":"POST",
+headers:{"content-type":"application/json"},
+body:JSON.stringify(data)
+}
+);
+
+document.getElementById("restaurantMessage").className="notice";
+document.getElementById("restaurantMessage").textContent="Restaurant saved successfully.";
+
+resetRestaurantForm();
+await loadRestaurants();
+await loadStats();
+
+}catch(error){
+
+document.getElementById("restaurantMessage").className="notice";
+document.getElementById("restaurantMessage").textContent=error.message;
+
+}
+
+});
+
+async function deleteRestaurant(id){
+
+if(!confirm("Delete this restaurant? This will also remove its reviews and categories.")) return;
+
+try{
+
+await api("/api/admin/restaurants/"+id,{
+method:"DELETE"
+});
+
+await loadRestaurants();
+await loadStats();
+
+}catch(error){
+alert(error.message);
+}
+
 }
 
 
-/* =========================================================
-   PUBLIC CSS
-   ========================================================= */
+// ------------------------------------------------------------
+// RECIPES
+// ------------------------------------------------------------
 
-function publicStyles() {
-  return (
-    "<style>" +
-    ":root{--green:#087f6c;--deep:#075c50;--cream:#fffaf0;--gold:#d8a83e;--orange:#f28c28;--ink:#17231f;--muted:#68746f;--white:#fff;--line:#e6e0d4}" +
-    "*{box-sizing:border-box}" +
-    "html{scroll-behavior:smooth}" +
-    "body{margin:0;background:var(--cream);color:var(--ink);font-family:Arial,sans-serif;line-height:1.6}" +
-    "a{color:inherit;text-decoration:none}" +
-    ".site-nav{height:76px;padding:0 5%;display:flex;align-items:center;justify-content:space-between;background:rgba(255,250,240,.96);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10}" +
-    ".brand{font-family:Georgia,serif;font-size:28px;font-weight:bold;color:var(--deep)}" +
-    ".brand span{color:var(--gold);font-size:18px;margin-left:5px}" +
-    ".nav-links{display:flex;gap:25px;font-size:14px;font-weight:bold}" +
-    ".nav-links a:hover{color:var(--green)}" +
-    ".site-main{max-width:1250px;margin:auto;padding:0 5% 70px}" +
-    ".hero{min-height:480px;display:grid;grid-template-columns:1.1fr .9fr;align-items:center;gap:40px}" +
-    ".hero h1{font-family:Georgia,serif;font-size:clamp(44px,7vw,82px);line-height:1.02;margin:12px 0 25px;color:var(--deep)}" +
-    ".hero p{font-size:20px;max-width:620px;color:var(--muted)}" +
-    ".eyebrow{font-size:11px;letter-spacing:2px;text-transform:uppercase;font-weight:bold;color:var(--orange)}" +
-    ".hero-art{height:390px;border-radius:50% 45% 55% 40%;background:linear-gradient(135deg,#075c50,#087f6c);display:flex;align-items:center;justify-content:center;box-shadow:20px 25px 0 rgba(216,168,62,.18)}" +
-    ".hero-orb{width:180px;height:180px;border-radius:50%;background:var(--cream);color:var(--gold);display:flex;align-items:center;justify-content:center;font-size:75px;box-shadow:0 20px 60px rgba(0,0,0,.15)}" +
-    ".search-panel{background:#fff;border:1px solid var(--line);padding:18px;border-radius:16px;box-shadow:0 10px 30px rgba(30,60,50,.06);margin-bottom:70px}" +
-    ".search-panel form{display:grid;grid-template-columns:2fr 1fr 1.3fr auto;gap:10px}" +
-    "input,select,textarea{width:100%;border:1px solid #d9d5ca;border-radius:9px;padding:13px 14px;background:#fff;font:inherit;color:var(--ink)}" +
-    "textarea{resize:vertical}" +
-    "label{display:block;font-weight:bold;margin:12px 0 6px}" +
-    ".button{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:9px;background:var(--green);color:#fff;padding:13px 20px;font-weight:bold;cursor:pointer;font-size:14px}" +
-    ".button:hover{background:var(--deep)}" +
-    ".button.secondary{background:var(--cream);color:var(--deep);border:1px solid var(--line)}" +
-    ".section{padding:30px 0 70px}" +
-    ".section.alternate{border-top:1px solid var(--line);border-bottom:1px solid var(--line)}" +
-    ".section-heading{display:flex;align-items:end;justify-content:space-between;margin-bottom:25px}" +
-    ".section-heading h2,.card h2{font-family:Georgia,serif;font-size:38px;margin:5px 0 0;color:var(--deep)}" +
-    ".card-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:22px}" +
-    ".restaurant-card,.recipe-card,.story-card{background:#fff;border:1px solid var(--line);border-radius:14px;overflow:hidden;transition:.2s;display:block}" +
-    ".restaurant-card:hover,.recipe-card:hover,.story-card:hover{transform:translateY(-4px);box-shadow:0 15px 35px rgba(30,60,50,.1)}" +
-    ".card-image{height:180px;display:flex;align-items:center;justify-content:center;font-size:65px}" +
-    ".restaurant-art{background:#e6f0e9}" +
-    ".recipe-art{background:#f7ead4}" +
-    ".card-body{padding:20px}" +
-    ".card-body h3{font-family:Georgia,serif;font-size:24px;color:var(--deep);margin:6px 0}" +
-    ".card-body p{color:var(--muted)}" +
-    ".rating{font-weight:bold;color:var(--gold)}" +
-    ".muted{color:var(--muted);font-size:13px}" +
-    ".story-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:20px}" +
-    ".story-card{display:grid;grid-template-columns:90px 1fr}" +
-    ".story-icon{background:var(--deep);color:var(--gold);display:flex;align-items:center;justify-content:center;font-size:34px}" +
-    ".manifesto{margin:40px 0;padding:70px 8%;background:var(--deep);color:#fff;border-radius:22px;text-align:center}" +
-    ".manifesto h2{font-family:Georgia,serif;font-size:clamp(30px,5vw,54px);line-height:1.15;font-weight:normal;margin:15px auto;max-width:950px}" +
-    ".detail-hero{padding:60px 0 40px}" +
-    ".detail-hero h1,.story-page h1{font-family:Georgia,serif;font-size:clamp(42px,6vw,72px);line-height:1.05;color:var(--deep);margin:10px 0 15px}" +
-    ".rating-big{font-size:28px;color:var(--gold);font-weight:bold}" +
-    ".back-link{color:var(--green);font-weight:bold;font-size:14px}" +
-    ".pill-line{color:var(--muted)}" +
-    ".content-grid{display:grid;grid-template-columns:2fr 1fr;gap:25px}" +
-    ".main-column,.side-column{display:flex;flex-direction:column;gap:25px}" +
-    ".card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:25px}" +
-    ".card h3{font-family:Georgia,serif;color:var(--deep);font-size:25px}" +
-    ".review-card{padding:18px 0;border-bottom:1px solid var(--line)}" +
-    ".review-card:last-child{border-bottom:0}" +
-    ".review-top{display:flex;justify-content:space-between;color:var(--gold)}" +
-    ".review-card h4{margin:5px 0}" +
-    ".review-card p{color:var(--muted)}" +
-    ".recipe-meta{display:flex;gap:12px;flex-wrap:wrap;margin-top:25px}" +
-    ".meta-box{background:#fff;border:1px solid var(--line);padding:14px 18px;border-radius:10px;min-width:100px}" +
-    ".meta-box strong{display:block;color:var(--deep)}" +
-    ".card li{margin:8px 0}" +
-    ".card ol li{padding-left:8px;margin-bottom:14px}" +
-    ".story-page{max-width:850px;margin:70px auto}" +
-    ".story-page .lead{font-size:22px;color:var(--muted)}" +
-    ".story-meta{color:var(--muted);font-size:13px;margin:20px 0 35px}" +
-    ".story-content{font-size:18px;line-height:1.9}" +
-    ".site-footer{padding:40px 5%;border-top:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;color:var(--muted)}" +
-    ".empty{padding:20px;color:var(--muted);background:#faf8f2;border-radius:10px}.empty.wide{padding:40px;text-align:center}" +
-    ".notice{padding:12px;background:#f7ead4;border-left:4px solid var(--orange);margin:15px 0}" +
-    "@media(max-width:850px){.nav-links{gap:12px;font-size:12px}.hero{grid-template-columns:1fr}.hero-art{height:260px}.search-panel form{grid-template-columns:1fr}.card-grid{grid-template-columns:1fr 1fr}.content-grid{grid-template-columns:1fr}.story-grid{grid-template-columns:1fr}}" +
-    "@media(max-width:550px){.site-nav{height:auto;min-height:65px;padding:12px 5%;align-items:flex-start}.nav-links{display:none}.hero h1{font-size:48px}.card-grid{grid-template-columns:1fr}.site-footer{display:block}.section-heading{align-items:start;gap:10px;flex-direction:column}}" +
-    "</style>"
-  );
+async function loadRecipes(){
+
+var box=document.getElementById("recipeList");
+
+try{
+
+var data=await api("/api/admin/recipes");
+
+recipes=data.recipes||[];
+
+if(!recipes.length){
+box.innerHTML='<div class="empty">No recipes yet. Use Add Recipe.</div>';
+return;
+}
+
+box.innerHTML=
+'<table class="adminTable">'+
+'<tr>'+
+'<th>Recipe</th>'+
+'<th>Cuisine</th>'+
+'<th>Difficulty</th>'+
+'<th>Actions</th>'+
+'</tr>'+
+recipes.map(function(r){
+
+return '<tr>'+
+'<td><strong>'+escapeClient(r.title)+'</strong><br>'+escapeClient(r.category||"")+'</td>'+
+'<td>'+escapeClient(r.cuisine||"")+'</td>'+
+'<td>'+escapeClient(r.difficulty||"")+'</td>'+
+'<td>'+
+'<button class="smallBtn" onclick="editRecipe('+r.id+')">Edit</button>'+
+'<button class="smallBtn danger" onclick="deleteRecipe('+r.id+')">Delete</button>'+
+'</td>'+
+'</tr>';
+
+}).join("")+
+'</table>';
+
+}catch(error){
+
+box.innerHTML='<div class="notice">'+escapeClient(error.message)+'</div>';
+
+}
+
+}
+
+function addIngredientRow(value,quantity){
+
+var row=document.createElement("div");
+
+row.className="two";
+
+row.style.marginBottom="8px";
+
+row.innerHTML=
+'<input class="ingredientName" placeholder="Ingredient" value="'+escapeAttr(value||"")+'">'+
+'<div style="display:flex;gap:5px">'+
+'<input class="ingredientQuantity" placeholder="Quantity" value="'+escapeAttr(quantity||"")+'">'+
+'<button type="button" onclick="this.parentElement.parentElement.remove()">×</button>'+
+'</div>';
+
+document.getElementById("ingredientRows").appendChild(row);
+
+}
+
+function addStepRow(value){
+
+var row=document.createElement("div");
+
+row.style.display="flex";
+row.style.gap="6px";
+row.style.marginBottom="8px";
+
+row.innerHTML=
+'<textarea class="stepInstruction" placeholder="Step instruction">'+
+escapeClient(value||"")+
+'</textarea>'+
+'<button type="button" onclick="this.parentElement.remove()">×</button>';
+
+document.getElementById("stepRows").appendChild(row);
+
+}
+
+function resetRecipeForm(){
+
+var form=document.getElementById("recipeEditor");
+
+form.reset();
+
+form.elements.id.value="";
+
+document.getElementById("ingredientRows").innerHTML="";
+document.getElementById("stepRows").innerHTML="";
+
+addIngredientRow();
+addStepRow();
+
+}
+
+async function editRecipe(id){
+
+var r=recipes.find(function(x){
+return Number(x.id)===Number(id);
+});
+
+if(!r) return;
+
+var form=document.getElementById("recipeEditor");
+
+form.elements.id.value=r.id;
+form.elements.title.value=r.title||"";
+form.elements.slug.value=r.slug||"";
+form.elements.description.value=r.description||"";
+form.elements.category.value=r.category||"";
+form.elements.cuisine.value=r.cuisine||"";
+form.elements.prep_minutes.value=r.prep_minutes||0;
+form.elements.cook_minutes.value=r.cook_minutes||0;
+form.elements.servings.value=r.servings||1;
+form.elements.difficulty.value=r.difficulty||"Easy";
+form.elements.rating.value=r.rating||0;
+form.elements.featured.checked=Boolean(r.featured);
+form.elements.status.value=r.status||"published";
+
+try{
+
+var response=await api("/recipe/"+encodeURIComponent(r.slug));
+
+var doc=new DOMParser().parseFromString(response.html||"","text/html");
+
+}catch(error){}
+
+document.getElementById("ingredientRows").innerHTML="";
+document.getElementById("stepRows").innerHTML="";
+
+addIngredientRow();
+addStepRow();
+
+showPanel("recipeForm");
+
+}
+
+document.getElementById("recipeEditor").addEventListener("submit",async function(e){
+
+e.preventDefault();
+
+var form=e.target;
+
+var data=Object.fromEntries(new FormData(form).entries());
+
+data.prep_minutes=Number(data.prep_minutes||0);
+data.cook_minutes=Number(data.cook_minutes||0);
+data.servings=Number(data.servings||1);
+data.rating=Number(data.rating||0);
+data.featured=form.elements.featured.checked;
+
+data.ingredients=[];
+
+document.querySelectorAll("#ingredientRows > div").forEach(function(row){
+
+var ingredient=row.querySelector(".ingredientName");
+var quantity=row.querySelector(".ingredientQuantity");
+
+if(ingredient && ingredient.value.trim()){
+
+data.ingredients.push({
+ingredient:ingredient.value.trim(),
+quantity:quantity?quantity.value.trim():""
+});
+
+}
+
+});
+
+data.steps=[];
+
+document.querySelectorAll(".stepInstruction").forEach(function(el){
+
+if(el.value.trim()){
+data.steps.push({
+instruction:el.value.trim()
+});
+}
+
+});
+
+var id=data.id;
+
+delete data.id;
+
+try{
+
+await api(
+id
+?"/api/admin/recipes/"+id
+:"/api/admin/recipes",
+{
+method:id?"PUT":"POST",
+headers:{"content-type":"application/json"},
+body:JSON.stringify(data)
+}
+);
+
+document.getElementById("recipeMessage").className="notice";
+document.getElementById("recipeMessage").textContent="Recipe saved successfully.";
+
+resetRecipeForm();
+
+await loadRecipes();
+await loadStats();
+
+}catch(error){
+
+document.getElementById("recipeMessage").className="notice";
+document.getElementById("recipeMessage").textContent=error.message;
+
+}
+
+});
+
+async function deleteRecipe(id){
+
+if(!confirm("Delete this recipe?")) return;
+
+try{
+
+await api("/api/admin/recipes/"+id,{
+method:"DELETE"
+});
+
+await loadRecipes();
+await loadStats();
+
+}catch(error){
+alert(error.message);
+}
+
 }
 
 
-/* =========================================================
-   ADMIN CSS
-   ========================================================= */
+// ------------------------------------------------------------
+// STORIES
+// ------------------------------------------------------------
 
-function adminStyles() {
-  return (
-    "<style>" +
-    ":root{--green:#087f6c;--deep:#075c50;--cream:#fffaf0;--gold:#d8a83e;--orange:#f28c28;--ink:#17231f;--muted:#68746f;--white:#fff;--line:#e4e0d6;--danger:#b7473b;--success:#22765d}" +
-    "*{box-sizing:border-box}" +
-    "body{margin:0;background:#f5f3ed;color:var(--ink);font-family:Arial,sans-serif}" +
-    "button,input,select,textarea{font:inherit}" +
-    "button{cursor:pointer}" +
-    ".brand{font-family:Georgia,serif;font-size:27px;font-weight:bold;color:var(--deep)}" +
-    ".brand span{color:var(--gold);font-size:17px}" +
-    ".eyebrow{font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--orange);font-weight:bold}" +
-    ".login-wrap{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:25px;background:var(--cream)}" +
-    ".login-card{width:min(430px,100%);background:#fff;border:1px solid var(--line);border-radius:18px;padding:40px;box-shadow:0 20px 60px rgba(0,0,0,.08)}" +
-    ".login-card h1{font-family:Georgia,serif;color:var(--deep);font-size:40px;margin:8px 0}.login-card p{color:var(--muted);margin-bottom:30px}" +
-    "label{display:block;font-weight:bold;margin:13px 0 6px}input,select,textarea{width:100%;padding:12px;border:1px solid #d7d3c9;border-radius:8px;background:#fff;color:var(--ink)}textarea{resize:vertical}" +
-    ".button{border:0;background:var(--green);color:#fff;border-radius:8px;padding:12px 18px;font-weight:bold;margin-top:15px}.button:hover{background:var(--deep)}" +
-    ".back-link{display:inline-block;color:var(--green);font-weight:bold;margin-top:20px;font-size:13px}" +
-    ".admin-layout{display:flex;min-height:100vh}" +
-    ".admin-sidebar{width:240px;background:var(--deep);color:#fff;padding:28px 18px;position:fixed;left:0;top:0;bottom:0;display:flex;flex-direction:column;z-index:20}" +
-    ".admin-sidebar .brand{color:#fff;padding:0 12px 30px}.admin-sidebar .brand span{color:var(--gold)}" +
-    ".admin-label{font-size:9px;letter-spacing:2px;color:#9dc9bd;padding:0 12px 10px}" +
-    ".nav-btn{display:block;width:100%;text-align:left;background:transparent;border:0;color:#dbece7;padding:13px 12px;border-radius:8px;margin:2px 0;font-weight:bold}" +
-    ".nav-btn:hover,.nav-btn.active{background:#0b7665;color:#fff}" +
-    ".sidebar-bottom{margin-top:auto;border-top:1px solid rgba(255,255,255,.12);padding-top:15px}.sidebar-bottom a,.sidebar-bottom button{display:block;width:100%;text-align:left;color:#dbece7;background:transparent;border:0;padding:11px 12px}" +
-    ".admin-main{margin-left:240px;flex:1;padding:35px 4%;min-width:0}" +
-    ".admin-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:25px}.admin-top h1{font-family:Georgia,serif;color:var(--deep);font-size:40px;margin:5px 0}.mobile-menu{display:none}" +
-    ".admin-section{display:none}.admin-section.active{display:block}" +
-    ".stats-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-bottom:25px}" +
-    ".stat-card{background:#fff;border:1px solid var(--line);border-radius:12px;padding:20px}.stat-icon{font-size:20px}.stat-number{font-size:32px;font-weight:bold;color:var(--deep);margin-top:7px}.stat-label{color:var(--muted);font-size:13px}" +
-    ".dashboard-grid{display:grid;grid-template-columns:1.2fr .8fr;gap:20px}" +
-    ".panel{background:#fff;border:1px solid var(--line);border-radius:12px;padding:22px}.panel-heading{display:flex;align-items:center;justify-content:space-between}.panel-heading h2{font-family:Georgia,serif;color:var(--deep);margin:0}.text-btn{border:0;background:transparent;color:var(--green);font-weight:bold}" +
-    ".quick-actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:18px}.action-card{background:#faf8f2;border:1px solid var(--line);border-radius:10px;padding:18px;text-align:left;color:var(--deep)}.action-card:hover{border-color:var(--green)}.action-card strong,.action-card span{display:block}.action-card strong{margin:5px 0}.action-card span{font-size:12px;color:var(--muted)}" +
-    ".section-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}.section-head h2{font-family:Georgia,serif;color:var(--deep);font-size:32px;margin:0}.section-head p{color:var(--muted);margin:5px 0}" +
-    ".table-wrap{background:#fff;border:1px solid var(--line);border-radius:12px;overflow:auto}table{width:100%;border-collapse:collapse;min-width:750px}th,td{text-align:left;padding:14px;border-bottom:1px solid var(--line);font-size:13px}th{background:#faf8f2;color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:1px}td small{display:block;color:var(--muted);margin-top:3px}" +
-    ".small-btn{border:1px solid var(--line);background:#fff;padding:7px 10px;border-radius:6px;font-size:12px;font-weight:bold;color:var(--deep)}.small-btn:hover{border-color:var(--green)}.small-btn.danger{color:var(--danger)}.small-btn.success{color:var(--success)}" +
-    ".status{display:inline-block;padding:4px 8px;border-radius:20px;background:#eef4f0;color:var(--green);font-size:10px;font-weight:bold;text-transform:uppercase}" +
-    ".filter-row{display:flex;gap:7px;margin-bottom:15px;flex-wrap:wrap}.filter-btn{border:1px solid var(--line);background:#fff;padding:8px 13px;border-radius:20px;color:var(--muted);font-weight:bold;font-size:12px}.filter-btn.active{background:var(--deep);color:#fff;border-color:var(--deep)}" +
-    ".admin-review{background:#fff;border:1px solid var(--line);border-radius:12px;padding:20px;margin-bottom:12px}.review-header{display:flex;justify-content:space-between;gap:15px}.review-header strong,.review-header span{display:block}.review-header span{color:var(--muted);font-size:12px}.review-rating{color:var(--gold);white-space:nowrap}.admin-review h3{margin:12px 0 4px}.admin-review p{color:var(--muted)}.review-footer{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.review-footer>div{margin-left:auto}.mini-review{display:grid;grid-template-columns:1fr auto;gap:3px 15px;border-bottom:1px solid var(--line);padding:13px 0}.mini-review:last-child{border-bottom:0}.mini-review span{color:var(--muted);font-size:12px}.mini-review span:last-child{color:var(--gold);grid-column:2;grid-row:1 / span 2}" +
-    ".admin-success,.admin-error{padding:11px 14px;border-radius:8px;margin-bottom:15px}.admin-success{background:#e6f4ed;color:var(--success)}.admin-error{background:#fae9e6;color:var(--danger)}" +
-    ".modal{position:fixed;inset:0;z-index:100;display:flex;align-items:center;justify-content:center;padding:20px}.modal.hidden{display:none}.modal-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.55)}.modal-card{position:relative;background:#fff;width:min(850px,100%);max-height:92vh;overflow:auto;border-radius:14px;padding:30px;z-index:1}.modal-close{position:absolute;right:15px;top:10px;border:0;background:transparent;font-size:30px;color:var(--muted)}.modal-heading h2{font-family:Georgia,serif;color:var(--deep);font-size:34px;margin:5px 0 20px}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:0 15px}.form-grid label{margin-top:5px}.check{display:flex;align-items:center;gap:8px}.check input{width:auto}" +
-    ".empty{padding:25px;color:var(--muted);text-align:center}.empty.wide{padding:50px}" +
-    "@media(max-width:1000px){.stats-grid{grid-template-columns:repeat(3,1fr)}.dashboard-grid{grid-template-columns:1fr}}" +
-    "@media(max-width:750px){.admin-sidebar{transform:translateX(-100%);transition:.2s}.admin-sidebar.open{transform:translateX(0)}.admin-main{margin-left:0;padding:25px 18px}.mobile-menu{display:block;border:1px solid var(--line);background:#fff;border-radius:7px;padding:8px 12px}.stats-grid{grid-template-columns:1fr 1fr}.quick-actions{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr}.section-head{align-items:flex-start;gap:15px;flex-direction:column}.admin-top h1{font-size:32px}}" +
-    "@media(max-width:450px){.stats-grid{grid-template-columns:1fr}.admin-main{padding:20px 12px}}" +
-    "</style>"
-  );
+async function loadStories(){
+
+var box=document.getElementById("storyList");
+
+try{
+
+var data=await api("/api/admin/stories");
+
+stories=data.stories||[];
+
+if(!stories.length){
+box.innerHTML='<div class="empty">No stories yet. Use Add Story.</div>';
+return;
+}
+
+box.innerHTML=
+'<table class="adminTable">'+
+'<tr>'+
+'<th>Title</th>'+
+'<th>Category</th>'+
+'<th>Status</th>'+
+'<th>Actions</th>'+
+'</tr>'+
+stories.map(function(s){
+
+return '<tr>'+
+'<td><strong>'+escapeClient(s.title)+'</strong></td>'+
+'<td>'+escapeClient(s.category||"")+'</td>'+
+'<td>'+escapeClient(s.status)+'</td>'+
+'<td>'+
+'<button class="smallBtn" onclick="editStory('+s.id+')">Edit</button>'+
+'<button class="smallBtn danger" onclick="deleteStory('+s.id+')">Delete</button>'+
+'</td>'+
+'</tr>';
+
+}).join("")+
+'</table>';
+
+}catch(error){
+
+box.innerHTML='<div class="notice">'+escapeClient(error.message)+'</div>';
+
+}
+
+}
+
+function resetStoryForm(){
+
+var form=document.getElementById("storyEditor");
+
+form.reset();
+
+form.elements.id.value="";
+
+form.elements.author_name.value="Tastify";
+
+}
+
+function editStory(id){
+
+var s=stories.find(function(x){
+return Number(x.id)===Number(id);
+});
+
+if(!s) return;
+
+var form=document.getElementById("storyEditor");
+
+form.elements.id.value=s.id;
+form.elements.title.value=s.title||"";
+form.elements.slug.value=s.slug||"";
+form.elements.excerpt.value=s.excerpt||"";
+form.elements.content.value=s.content||"";
+form.elements.author_name.value=s.author_name||"Tastify";
+form.elements.category.value=s.category||"";
+form.elements.featured.checked=Boolean(s.featured);
+form.elements.status.value=s.status||"published";
+
+showPanel("storyForm");
+
+}
+
+document.getElementById("storyEditor").addEventListener("submit",async function(e){
+
+e.preventDefault();
+
+var form=e.target;
+
+var data=Object.fromEntries(new FormData(form).entries());
+
+data.featured=form.elements.featured.checked;
+
+var id=data.id;
+
+delete data.id;
+
+try{
+
+await api(
+id
+?"/api/admin/stories/"+id
+:"/api/admin/stories",
+{
+method:id?"PUT":"POST",
+headers:{"content-type":"application/json"},
+body:JSON.stringify(data)
+}
+);
+
+document.getElementById("storyMessage").className="notice";
+document.getElementById("storyMessage").textContent="Story saved successfully.";
+
+resetStoryForm();
+
+await loadStories();
+await loadStats();
+
+}catch(error){
+
+document.getElementById("storyMessage").className="notice";
+document.getElementById("storyMessage").textContent=error.message;
+
+}
+
+});
+
+async function deleteStory(id){
+
+if(!confirm("Delete this story?")) return;
+
+try{
+
+await api("/api/admin/stories/"+id,{
+method:"DELETE"
+});
+
+await loadStories();
+await loadStats();
+
+}catch(error){
+alert(error.message);
+}
+
 }
 
 
-/* =========================================================
-   GENERIC HELPERS
-   ========================================================= */
+// ------------------------------------------------------------
+// REVIEWS
+// ------------------------------------------------------------
 
-async function parseJson(request) {
-  try {
-    return await request.json();
-  } catch {
-    return {};
-  }
+async function loadReviews(){
+
+var box=document.getElementById("reviewList");
+
+var status=document.getElementById("reviewStatus").value;
+
+try{
+
+var data=await api(
+"/api/admin/reviews?status="+encodeURIComponent(status)
+);
+
+var reviews=data.reviews||[];
+
+if(!reviews.length){
+
+box.innerHTML='<div class="empty">No reviews found.</div>';
+
+return;
+
 }
 
-function cleanText(value) {
-  if (
-    value === null ||
-    value === undefined
-  ) {
-    return "";
-  }
+box.innerHTML=reviews.map(function(r){
 
-  return String(value).trim();
+var buttons="";
+
+if(r.status!=="approved"){
+
+buttons+='<button class="smallBtn success" onclick="approveReview('+r.id+')">Approve</button>';
+
 }
 
-function nullableInteger(value) {
-  if (
-    value === null ||
-    value === undefined ||
-    value === ""
-  ) {
-    return null;
-  }
+if(r.status!=="rejected"){
 
-  const number = Number(value);
+buttons+='<button class="smallBtn danger" onclick="rejectReview('+r.id+')">Reject</button>';
 
-  if (!Number.isInteger(number)) {
-    return null;
-  }
-
-  return number;
 }
 
-function validNonNegativeInteger(value) {
-  const number = Number(value);
+return '<div class="review">'+
+'<strong>'+escapeClient(r.author_name)+'</strong>'+
+'<div class="rating">★ '+escapeClient(r.overall_rating)+'/5</div>'+
+'<div class="meta">'+escapeClient(r.restaurant_name)+' · '+escapeClient(r.status)+'</div>'+
+(r.title?'<h3>'+escapeClient(r.title)+'</h3>':"")+
+'<p>'+escapeClient(r.body)+'</p>'+
+buttons+
+'</div>';
 
-  if (!Number.isFinite(number)) {
-    return 0;
-  }
+}).join("");
 
-  return Math.max(
-    0,
-    Math.floor(number)
-  );
+}catch(error){
+
+box.innerHTML='<div class="notice">'+escapeClient(error.message)+'</div>';
+
 }
 
-function validRatingNumber(value) {
-  const number = Number(value);
-
-  if (!Number.isFinite(number)) {
-    return 0;
-  }
-
-  return Math.round(
-    Math.max(0, Math.min(5, number)) * 10
-  ) / 10;
 }
 
-function optionalRating(value) {
-  if (
-    value === null ||
-    value === undefined ||
-    value === ""
-  ) {
-    return null;
-  }
+async function approveReview(id){
 
-  const number = Number(value);
+try{
 
-  if (
-    !Number.isFinite(number) ||
-    number < 1 ||
-    number > 5
-  ) {
-    return null;
-  }
+await api("/api/admin/reviews/"+id+"/approve",{
+method:"POST"
+});
 
-  return Math.round(number);
+await loadReviews();
+await loadStats();
+
+}catch(error){
+alert(error.message);
 }
 
-function validStatus(value, allowed) {
-  const status = cleanText(value);
-
-  return allowed.indexOf(status) !== -1
-    ? status
-    : null;
 }
 
-function slugify(value) {
-  return cleanText(value)
-    .toLowerCase()
-    .normalize("NFKD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .substring(0, 100);
+async function rejectReview(id){
+
+if(!confirm("Reject this review?")) return;
+
+try{
+
+await api("/api/admin/reviews/"+id+"/reject",{
+method:"POST"
+});
+
+await loadReviews();
+await loadStats();
+
+}catch(error){
+alert(error.message);
 }
 
-async function makeUniqueSlug(
-  env,
-  table,
-  candidate,
-  excludeId
-) {
-  const allowedTables = [
-    "restaurants",
-    "recipes",
-    "food_stories",
-    "cities"
-  ];
-
-  if (allowedTables.indexOf(table) === -1) {
-    throw new Error("Invalid table");
-  }
-
-  let base = slugify(candidate);
-
-  if (!base) {
-    base = "item";
-  }
-
-  let slug = base;
-  let counter = 2;
-
-  while (true) {
-    let sql =
-      "SELECT id FROM " +
-      table +
-      " WHERE slug = ?";
-
-    const params = [slug];
-
-    if (
-      excludeId !== undefined &&
-      excludeId !== null
-    ) {
-      sql += " AND id != ?";
-      params.push(excludeId);
-    }
-
-    sql += " LIMIT 1";
-
-    const existing = await env.DB.prepare(sql)
-      .bind(...params)
-      .first();
-
-    if (!existing) {
-      return slug;
-    }
-
-    slug =
-      base +
-      "-" +
-      String(counter);
-
-    counter++;
-  }
 }
 
-function safeUrl(value) {
-  const text = cleanText(value);
 
-  if (!text) {
-    return "";
-  }
+// ------------------------------------------------------------
+// CLIENT ESCAPING
+// ------------------------------------------------------------
 
-  try {
-    const url =
-      /^https?:\/\//i.test(text)
-        ? new URL(text)
-        : new URL("https://" + text);
+function escapeClient(value){
 
-    if (
-      url.protocol !== "http:" &&
-      url.protocol !== "https:"
-    ) {
-      return "";
-    }
+return String(value==null?"":value)
+.replace(/&/g,"&")
+.replace(/</g,"<")
+.replace(/>/g,">")
+.replace(/"/g,"&quot;")
+.replace(/'/g,"&#039;");
 
-    return url.toString();
-  } catch {
-    return "";
-  }
 }
 
-function escapeHtml(value) {
-  return String(
-    value === null || value === undefined
-      ? ""
-      : value
-  )
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
+function escapeAttr(value){
+
+return escapeClient(value);
+
 }
 
-function escapeAttribute(value) {
-  return escapeHtml(value);
-}
 
-function formatRating(value) {
-  const number = Number(value || 0);
+// ------------------------------------------------------------
+// START DASHBOARD
+// ------------------------------------------------------------
 
-  return number > 0
-    ? number.toFixed(1) + " ★"
-    : "No rating";
-}
+resetRecipeForm();
+loadStats();
 
-function formatDate(value) {
-  if (!value) {
-    return "";
-  }
+</script>
+`;
 
-  try {
-    const date = new Date(
-      String(value).replace(" ", "T") +
-        "Z"
-    );
-
-    return date.toLocaleDateString(
-      undefined,
-      {
-        year: "numeric",
-        month: "short",
-        day: "numeric"
-      }
-    );
-  } catch {
-    return String(value);
-  }
-}
-
-function makeExcerpt(text, length) {
-  const value = cleanText(text);
-
-  if (value.length <= length) {
-    return value;
-  }
-
-  return value.substring(0, length).trim() + "…";
-}
-
-function detailRow(label, value) {
-  if (!value) {
-    return "";
-  }
-
-  return (
-    '<div style="padding:10px 0;border-bottom:1px solid #e6e0d4">' +
-    '<small style="display:block;color:#68746f">' +
-    escapeHtml(label) +
-    "</small>" +
-    "<strong>" +
-    escapeHtml(value) +
-    "</strong>" +
-    "</div>"
-  );
-}
-
-function metaBox(label, value) {
-  return (
-    '<div class="meta-box">' +
-    "<small>" +
-    escapeHtml(label) +
-    "</small>" +
-    "<strong>" +
-    escapeHtml(String(value)) +
-    "</strong>" +
-    "</div>"
-  );
-}
-
-function notFoundPage() {
-  return (
-    '<div style="max-width:700px;margin:100px auto;text-align:center">' +
-    '<div class="eyebrow">Tastify</div>' +
-    '<h1 style="font-family:Georgia,serif;color:#075c50;font-size:60px">Page Not Found</h1>' +
-    '<p style="color:#68746f">The page you are looking for does not exist.</p>' +
-    '<a class="button" href="/">Return Home</a>' +
-    "</div>"
+  return pageShell(
+    "Admin Dashboard",
+    content,
+    script
   );
 }
