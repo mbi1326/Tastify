@@ -247,12 +247,6 @@ export default {
 
         return origin === new URL(request.url).origin;
       };
-if (path === "/debug-admin" && method === "GET") {
-  return json({
-    passwordConfigured: Boolean(env.ADMIN_PASSWORD),
-    secretConfigured: Boolean(env.ADMIN_SECRET)
-  });
-}
       // ------------------------------------------------------------
       // ADMIN LOGIN
       // ------------------------------------------------------------
@@ -1743,7 +1737,32 @@ if (path === "/debug-admin" && method === "GET") {
       // ------------------------------------------------------------
 
       if (path === "/" && method === "GET") {
-        return html(await homePage(url, env));
+        return html(await publicHomePage(env, url));
+      }
+
+      if (path === "/restaurants" && method === "GET") {
+        return html(await publicRestaurantListPage(env, url));
+      }
+
+      if (path === "/recipes" && method === "GET") {
+        return html(await publicRecipeListPage(env, url));
+      }
+
+      if (path === "/stories" && method === "GET") {
+        return html(await publicStoryListPage(env, url));
+      }
+
+      if (path === "/about" && method === "GET") {
+        return html(publicAboutPage());
+      }
+
+      if (path === "/search" && method === "GET") {
+        return html(await publicSearchPage(env, url));
+      }
+
+      const cityPublicMatch = path.match(/^\/city\/([^/]+)$/);
+      if (cityPublicMatch && method === "GET") {
+        return html(await publicCityPage(env, decodeURIComponent(cityPublicMatch[1])));
       }
 
       // ------------------------------------------------------------
@@ -1784,6 +1803,153 @@ if (path === "/debug-admin" && method === "GET") {
   }
 };
 
+
+// ================================================================
+// PUBLIC SITE - RELEASE 1
+// ================================================================
+
+function publicCardImage(label, emoji) {
+  return `<div class="publicCardImage"><span>${emoji}</span><small>${escapeHtml(label)}</small></div>`;
+}
+
+function publicSectionHead(kicker, title, text, href, linkText) {
+  return `<div class="publicSectionHead"><div><div class="kicker">${escapeHtml(kicker)}</div><h2>${escapeHtml(title)}</h2><p>${escapeHtml(text)}</p></div>${href ? `<a class="btn" href="${escapeHtml(href)}">${escapeHtml(linkText || "Explore")}</a>` : ""}</div>`;
+}
+
+function publicRestaurantCard(r) {
+  return `<article class="publicCard">
+    ${publicCardImage(r.cuisine || "Restaurant", "­ЪЇй№ИЈ")}
+    <div class="publicCardBody">
+      <div class="eyebrow">${escapeHtml(r.city_name || r.city || "Pakistan")}${r.area ? " ┬и " + escapeHtml(r.area) : ""}</div>
+      <h3><a href="/restaurant/${encodeURIComponent(r.slug)}">${escapeHtml(r.name)}</a></h3>
+      <div class="rating">РўЁ ${Number(r.rating || 0).toFixed(1)} <span>(${Number(r.review_count || 0)} reviews)</span></div>
+      <p>${escapeHtml(r.description || "Discover this place with Tastify.")}</p>
+      <div class="tagRow"><span class="tag">${escapeHtml(r.cuisine || "Food")}</span>${r.price_range ? `<span class="tag">${escapeHtml(r.price_range)}</span>` : ""}</div>
+      <a class="textLink" href="/restaurant/${encodeURIComponent(r.slug)}">View restaurant Рєњ</a>
+    </div>
+  </article>`;
+}
+
+function publicRecipeCard(r) {
+  const total = Number(r.prep_minutes || 0) + Number(r.cook_minutes || 0);
+  return `<article class="publicCard">
+    ${publicCardImage(r.category || "Recipe", "­ЪЦў")}
+    <div class="publicCardBody">
+      <div class="eyebrow">${escapeHtml(r.cuisine || "Home Cooking")} ┬и ${escapeHtml(r.difficulty || "Easy")}</div>
+      <h3><a href="/recipe/${encodeURIComponent(r.slug)}">${escapeHtml(r.title)}</a></h3>
+      <div class="rating">РўЁ ${Number(r.rating || 0).toFixed(1)} <span>┬и ${total} min</span></div>
+      <p>${escapeHtml(r.description || "A simple Tastify recipe for home cooks.")}</p>
+      <a class="textLink" href="/recipe/${encodeURIComponent(r.slug)}">View recipe Рєњ</a>
+    </div>
+  </article>`;
+}
+
+function publicStoryCard(s) {
+  return `<article class="publicCard storyCard">
+    ${publicCardImage(s.category || "Food Story", "Рюд")}
+    <div class="publicCardBody">
+      <div class="eyebrow">${escapeHtml(s.category || "Food Story")}</div>
+      <h3><a href="/story/${encodeURIComponent(s.slug)}">${escapeHtml(s.title)}</a></h3>
+      <p>${escapeHtml(s.excerpt || "A story from the world of food and culture.")}</p>
+      <div class="byline">By ${escapeHtml(s.author_name || "Tastify")}</div>
+      <a class="textLink" href="/story/${encodeURIComponent(s.slug)}">Read story Рєњ</a>
+    </div>
+  </article>`;
+}
+
+function publicFilterBar(action, fields, url) {
+  return `<form class="publicFilters" method="GET" action="${escapeHtml(action)}">
+    <input name="q" value="${escapeHtml(url.searchParams.get("q") || "")}" placeholder="Search Tastify...">
+    ${fields}
+    <button type="submit">Search</button>
+  </form>`;
+}
+
+async function publicHomePage(env, url) {
+  const [cities, restaurants, recipes, stories] = await Promise.all([
+    env.DB.prepare(`SELECT id,name,slug FROM cities ORDER BY name ASC`).all(),
+    env.DB.prepare(`SELECT r.*, c.name AS city_name FROM restaurants r LEFT JOIN cities c ON c.id=r.city_id WHERE r.status='published' ORDER BY r.featured DESC,r.rating DESC,r.name ASC LIMIT 6`).all(),
+    env.DB.prepare(`SELECT * FROM recipes WHERE status='published' ORDER BY featured DESC,rating DESC,title ASC LIMIT 6`).all(),
+    env.DB.prepare(`SELECT * FROM food_stories WHERE status='published' ORDER BY featured DESC,created_at DESC LIMIT 3`).all()
+  ]);
+  const cityOptions=(cities.results||[]).map(c=>`<option value="${escapeHtml(c.slug)}">${escapeHtml(c.name)}</option>`).join("");
+  const rs=restaurants.results||[], rec=recipes.results||[], st=stories.results||[];
+  const content=`
+  <section class="publicHero"><div class="container heroGrid">
+    <div><div class="kicker light">FOOD ┬и DISCOVERY ┬и STORIES</div><h1>Discover <em>With Tastify</em></h1><p class="heroLead">Recipes to cook. Places to discover. Stories to savor.</p>
+      <div class="heroActions"><a class="btn heroBtn" href="/recipes">Explore Recipes</a><a class="btn outlineBtn" href="/restaurants">Discover Restaurants</a></div>
+      <form class="heroSearch" method="GET" action="/search"><input name="q" placeholder="Search recipes, restaurants, cuisines..." aria-label="Search Tastify"><button type="submit">Search</button></form>
+    </div>
+    <div class="heroArt"><div class="plate">Рюд</div><span>Cook ┬и Discover ┬и Savor</span></div>
+  </div></section>
+  <section class="section"><div class="container">${publicSectionHead("TASTIFY KITCHEN","Recipes Worth Making","Easy recipes designed for real home cooks.","/recipes","View all recipes")}<div class="publicGrid">${rec.map(publicRecipeCard).join("") || `<div class="empty">Recipes are coming soon.</div>`}</div></div></section>
+  <section class="section altSection"><div class="container">${publicSectionHead("DISCOVER","Places Worth Finding","Explore restaurants by city, cuisine and rating.","/restaurants","Explore restaurants")}<div class="publicGrid">${rs.map(publicRestaurantCard).join("") || `<div class="empty">Restaurant listings are coming soon.</div>`}</div></div></section>
+  <section class="section"><div class="container">${publicSectionHead("FROM THE TABLE","Food Stories","The people, places, traditions and ideas behind what we eat.","/stories","Read all stories")}<div class="publicGrid storiesGrid">${st.map(publicStoryCard).join("") || `<div class="empty">Food stories are coming soon.</div>`}</div></div></section>
+  <section class="cityStrip"><div class="container"><div><div class="kicker">DISCOVER BY CITY</div><h2>Start somewhere delicious.</h2></div><div class="cityLinks">${(cities.results||[]).map(c=>`<a href="/city/${encodeURIComponent(c.slug)}">${escapeHtml(c.name)} <span>Рєњ</span></a>`).join("") || "<span>No cities yet.</span>"}</div></div></section>
+  <section class="manifesto"><div class="container"><div class="kicker">THE TASTIFY IDEA</div><h2>In the realms where food and art unite,<br><em>we aspire to be magicians.</em></h2><p>Tastify brings recipes, places and stories together so food feels like more than a meal.</p></div></section>`;
+  return pageShell("Discover With Tastify",content);
+}
+
+async function publicRestaurantListPage(env,url) {
+  const q=String(url.searchParams.get("q")||"").trim(), city=String(url.searchParams.get("city")||"").trim(), cuisine=String(url.searchParams.get("cuisine")||"").trim();
+  let sql=`SELECT r.*,c.name AS city_name,c.slug AS city_slug FROM restaurants r LEFT JOIN cities c ON c.id=r.city_id WHERE r.status='published'`, args=[];
+  if(q){sql+=` AND (r.name LIKE ? OR r.description LIKE ? OR r.cuisine LIKE ? OR r.area LIKE ?)`;const x=`%${q}%`;args.push(x,x,x,x)}
+  if(city){sql+=` AND c.slug=?`;args.push(city)}
+  if(cuisine){sql+=` AND r.cuisine LIKE ?`;args.push(`%${cuisine}%`)}
+  sql+=` ORDER BY r.featured DESC,r.rating DESC,r.name ASC`;
+  const [rows,cities]=await Promise.all([env.DB.prepare(sql).bind(...args).all(),env.DB.prepare(`SELECT name,slug FROM cities ORDER BY name`).all()]);
+  const cityOpts=(cities.results||[]).map(c=>`<option value="${escapeHtml(c.slug)}" ${city===c.slug?"selected":""}>${escapeHtml(c.name)}</option>`).join("");
+  const content=`<section class="introBand"><div class="container"><div class="kicker">TASTIFY DISCOVERY</div><h1>Restaurants</h1><p>Find places worth eating at Рђћ from familiar favorites to new discoveries.</p></div></section><section class="section"><div class="container">${publicFilterBar("/restaurants",`<select name="city"><option value="">All cities</option>${cityOpts}</select><input name="cuisine" value="${escapeHtml(cuisine)}" placeholder="Cuisine">`,url)}<div class="publicGrid">${(rows.results||[]).map(publicRestaurantCard).join("")||`<div class="empty">No restaurants matched your search.</div>`}</div></div></section>`;
+  return pageShell("Restaurants",content);
+}
+
+async function publicRecipeListPage(env,url) {
+  const q=String(url.searchParams.get("q")||"").trim(), category=String(url.searchParams.get("category")||"").trim();
+  let sql=`SELECT * FROM recipes WHERE status='published'`,args=[];
+  if(q){sql+=` AND (title LIKE ? OR description LIKE ? OR cuisine LIKE ? OR category LIKE ?)`;const x=`%${q}%`;args.push(x,x,x,x)}
+  if(category){sql+=` AND LOWER(category)=LOWER(?)`;args.push(category)}
+  sql+=` ORDER BY featured DESC,rating DESC,title ASC`;
+  const rows=await env.DB.prepare(sql).bind(...args).all();
+  const cats=await env.DB.prepare(`SELECT DISTINCT category FROM recipes WHERE status='published' AND category IS NOT NULL AND category!='' ORDER BY category`).all();
+  const opts=(cats.results||[]).map(c=>`<option value="${escapeHtml(c.category)}" ${category.toLowerCase()===String(c.category).toLowerCase()?"selected":""}>${escapeHtml(c.category)}</option>`).join("");
+  const content=`<section class="introBand"><div class="container"><div class="kicker">TASTIFY KITCHEN</div><h1>Recipes</h1><p>Simple ideas, useful techniques and recipes made for home cooks.</p></div></section><section class="section"><div class="container">${publicFilterBar("/recipes",`<select name="category"><option value="">All categories</option>${opts}</select>`,url)}<div class="publicGrid">${(rows.results||[]).map(publicRecipeCard).join("")||`<div class="empty">No recipes matched your search.</div>`}</div></div></section>`;
+  return pageShell("Recipes",content);
+}
+
+async function publicStoryListPage(env,url) {
+  const q=String(url.searchParams.get("q")||"").trim();
+  let sql=`SELECT * FROM food_stories WHERE status='published'`,args=[];
+  if(q){sql+=` AND (title LIKE ? OR excerpt LIKE ? OR content LIKE ? OR category LIKE ?)`;const x=`%${q}%`;args.push(x,x,x,x)}
+  sql+=` ORDER BY featured DESC,created_at DESC`;
+  const rows=await env.DB.prepare(sql).bind(...args).all();
+  const content=`<section class="introBand"><div class="container"><div class="kicker">FROM THE TABLE</div><h1>Food Stories</h1><p>Stories about food, culture, places and the people who make every table interesting.</p></div></section><section class="section"><div class="container">${publicFilterBar("/stories","",url)}<div class="publicGrid storiesGrid">${(rows.results||[]).map(publicStoryCard).join("")||`<div class="empty">No stories matched your search.</div>`}</div></div></section>`;
+  return pageShell("Food Stories",content);
+}
+
+async function publicSearchPage(env,url) {
+  const q=String(url.searchParams.get("q")||"").trim();
+  if(!q) return pageShell("Search",`<section class="introBand"><div class="container"><div class="kicker">TASTIFY SEARCH</div><h1>Search Tastify</h1><p>Find a recipe, restaurant or food story.</p>${publicFilterBar("/search","",url)}</div></section>`);
+  const x=`%${q}%`;
+  const [r,rec,s]=await Promise.all([
+    env.DB.prepare(`SELECT r.*,c.name AS city_name FROM restaurants r LEFT JOIN cities c ON c.id=r.city_id WHERE r.status='published' AND (r.name LIKE ? OR r.description LIKE ? OR r.cuisine LIKE ? OR r.area LIKE ?) ORDER BY r.rating DESC LIMIT 12`).bind(x,x,x,x).all(),
+    env.DB.prepare(`SELECT * FROM recipes WHERE status='published' AND (title LIKE ? OR description LIKE ? OR cuisine LIKE ? OR category LIKE ?) ORDER BY rating DESC LIMIT 12`).bind(x,x,x,x).all(),
+    env.DB.prepare(`SELECT * FROM food_stories WHERE status='published' AND (title LIKE ? OR excerpt LIKE ? OR content LIKE ? OR category LIKE ?) ORDER BY created_at DESC LIMIT 12`).bind(x,x,x,x).all()
+  ]);
+  const content=`<section class="introBand"><div class="container"><div class="kicker">TASTIFY SEARCH</div><h1>Results for Рђю${escapeHtml(q)}РђЮ</h1>${publicFilterBar("/search","",url)}</div></section><section class="section"><div class="container"><h2 class="resultTitle">Restaurants</h2><div class="publicGrid">${(r.results||[]).map(publicRestaurantCard).join("")||`<div class="empty">No restaurant results.</div>`}</div><h2 class="resultTitle">Recipes</h2><div class="publicGrid">${(rec.results||[]).map(publicRecipeCard).join("")||`<div class="empty">No recipe results.</div>`}</div><h2 class="resultTitle">Food Stories</h2><div class="publicGrid">${(s.results||[]).map(publicStoryCard).join("")||`<div class="empty">No story results.</div>`}</div></div></section>`;
+  return pageShell("Search",content);
+}
+
+async function publicCityPage(env,slug) {
+  const city=await env.DB.prepare(`SELECT * FROM cities WHERE slug=?`).bind(slug).first();
+  if(!city) return notFoundPage("City not found");
+  const rows=await env.DB.prepare(`SELECT r.*,c.name AS city_name FROM restaurants r LEFT JOIN cities c ON c.id=r.city_id WHERE r.status='published' AND c.slug=? ORDER BY r.featured DESC,r.rating DESC,r.name`).bind(slug).all();
+  const content=`<section class="introBand"><div class="container"><div class="kicker">DISCOVER BY CITY</div><h1>${escapeHtml(city.name)}</h1><p>Restaurants and food discoveries in ${escapeHtml(city.name)}.</p></div></section><section class="section"><div class="container"><div class="publicGrid">${(rows.results||[]).map(publicRestaurantCard).join("")||`<div class="empty">No restaurants have been added for this city yet.</div>`}</div></div></section>`;
+  return pageShell(city.name,content);
+}
+
+function publicAboutPage(){
+  return pageShell("About Tastify",`<section class="introBand"><div class="container"><div class="kicker">ABOUT TASTIFY</div><h1>Food is more than a meal.</h1><p>It is a place, a memory, a technique, a conversation and sometimes a little bit of magic.</p></div></section><section class="section"><div class="container aboutCopy"><h2>Why Tastify?</h2><p>Tastify is built around three simple ideas: help home cooks make something delicious, help people discover places worth visiting, and tell the stories that make food meaningful.</p><p>We are building a food destination where practical recipes meet thoughtful discovery and editorial storytelling.</p><div class="aboutQuote">РђюIn the realms where food and art unite, we aspire to be magicians.РђЮ</div></div></section>`);
+}
 
 // ================================================================
 // DATABASE HELPERS
@@ -2395,6 +2561,12 @@ footer{
     font-size:12px;
   }
 }
+
+.publicHero{padding:82px 0;background:radial-gradient(circle at 82% 18%,rgba(216,168,62,.28),transparent 28%),linear-gradient(135deg,#075c50,#087f6c);color:#fff}
+.heroGrid{display:grid;grid-template-columns:1.25fr .75fr;gap:40px;align-items:center}
+.publicHero h1{font-family:Georgia,serif;font-size:clamp(46px,7vw,82px);line-height:.98;margin:10px 0 20px}.publicHero h1 em{color:#f4d37b;font-weight:normal}.heroLead{font-size:21px;max-width:650px;opacity:.94}.heroActions{display:flex;gap:12px;flex-wrap:wrap;margin:28px 0}.heroBtn{background:#d8a83e;color:#2d2411}.outlineBtn{background:transparent;border:1px solid rgba(255,255,255,.7)}.heroSearch{display:flex;gap:8px;background:#fff;padding:8px;border-radius:12px;max-width:720px}.heroSearch input{border:0;outline:0;padding:13px;flex:1}.heroArt{min-height:330px;border:1px solid rgba(255,255,255,.25);border-radius:28px;background:radial-gradient(circle at 50% 42%,rgba(255,255,255,.14),transparent 34%);display:flex;flex-direction:column;align-items:center;justify-content:center}.plate{width:190px;height:190px;border:2px solid #f4d37b;border-radius:50%;display:grid;place-items:center;font-size:70px;color:#f4d37b;box-shadow:0 0 0 16px rgba(255,255,255,.05),inset 0 0 40px rgba(216,168,62,.18)}.heroArt span{margin-top:20px;font-size:13px;letter-spacing:2px;text-transform:uppercase}.kicker{font-size:12px;font-weight:800;letter-spacing:2px;color:#087f6c}.kicker.light{color:#f4d37b}.publicSectionHead{display:flex;justify-content:space-between;gap:24px;align-items:end;margin-bottom:26px}.publicSectionHead h2{font-family:Georgia,serif;font-size:38px;margin:5px 0}.publicSectionHead p{color:#6b6a63;margin:0;max-width:620px}.publicGrid{display:grid;grid-template-columns:repeat(3,1fr);gap:22px}.publicCard{background:#fff;border:1px solid #ded8ca;border-radius:18px;overflow:hidden;box-shadow:0 7px 24px rgba(0,0,0,.05)}.publicCardImage{height:185px;background:linear-gradient(135deg,#087f6c,#d8a83e);color:#fff;display:flex;align-items:center;justify-content:center;position:relative}.publicCardImage span{font-size:56px}.publicCardImage small{position:absolute;bottom:12px;left:15px;text-transform:uppercase;letter-spacing:1.5px;font-weight:800;font-size:10px}.publicCardBody{padding:21px}.publicCard h3{font-family:Georgia,serif;font-size:25px;margin:7px 0}.publicCard h3 a{color:#173f38}.publicCard p{color:#66645d;line-height:1.65}.eyebrow,.byline{font-size:12px;color:#77756e}.rating{color:#9a6c00;font-weight:800}.rating span{color:#777;font-weight:500}.tagRow{display:flex;gap:7px;flex-wrap:wrap;margin:13px 0}.textLink{font-weight:800;color:#075c50}.altSection{background:#f1eee6}.section{padding:65px 0}.cityStrip{padding:48px 0;background:#123f37;color:#fff}.cityStrip .container{display:flex;justify-content:space-between;gap:30px;align-items:center}.cityStrip h2{font-family:Georgia,serif;font-size:34px;margin:7px 0}.cityLinks{display:flex;gap:10px;flex-wrap:wrap}.cityLinks a{padding:11px 14px;border:1px solid rgba(255,255,255,.22);border-radius:30px;color:#fff}.cityLinks span{color:#f4d37b}.manifesto{padding:75px 0;background:#fffaf0}.manifesto h2{font-family:Georgia,serif;font-size:clamp(34px,5vw,58px);line-height:1.1}.manifesto h2 em{color:#087f6c;font-weight:normal}.manifesto p{max-width:650px;color:#666}.introBand{padding:65px 0;background:#f1eee6}.introBand h1{font-family:Georgia,serif;font-size:56px;margin:8px 0 12px}.introBand p{font-size:19px;color:#666;max-width:700px}.publicFilters{display:flex;gap:10px;background:#fff;padding:12px;border:1px solid #ded8ca;border-radius:14px;margin-bottom:30px}.publicFilters input,.publicFilters select{flex:1;min-width:0}.resultTitle{font-family:Georgia,serif;font-size:32px;margin:38px 0 18px}.aboutCopy{max-width:820px}.aboutCopy h2{font-family:Georgia,serif;font-size:40px}.aboutCopy p{font-size:18px;line-height:1.8;color:#555}.aboutQuote{margin-top:35px;padding:28px;border-left:4px solid #d8a83e;background:#fff;font-family:Georgia,serif;font-size:25px;color:#075c50}
+@media(max-width:800px){.heroGrid{grid-template-columns:1fr}.heroArt{display:none}.publicGrid{grid-template-columns:1fr 1fr}.publicSectionHead,.cityStrip .container{align-items:flex-start;flex-direction:column}.publicFilters{flex-direction:column}.introBand h1{font-size:44px}}
+@media(max-width:560px){.publicGrid{grid-template-columns:1fr}.publicHero{padding:58px 0}.publicHero h1{font-size:52px}.heroSearch{flex-direction:column}.heroSearch button{width:100%}}
 </style>
 </head>
 
@@ -2406,10 +2578,11 @@ footer{
 
 <nav>
 <a href="/">Home</a>
-<a href="/#restaurants">Restaurants</a>
-<a href="/#recipes">Recipes</a>
-<a href="/#stories">Stories</a>
-<a href="/admin">Admin</a>
+<a href="/restaurants">Restaurants</a>
+<a href="/recipes">Recipes</a>
+<a href="/stories">Food Stories</a>
+<a href="/about">About</a>
+<a href="/search">Search</a>
 </nav>
 </div>
 </header>
@@ -2489,9 +2662,9 @@ async function homePage(url, env) {
 <div class="cardImage">Tastify</div>
 <div class="cardBody">
 <h3>${escapeHtml(r.name)}</h3>
-<div class="meta">${escapeHtml(r.city_name || "")} ${r.area ? "· " + escapeHtml(r.area) : ""}</div>
+<div class="meta">${escapeHtml(r.city_name || "")} ${r.area ? "┬и " + escapeHtml(r.area) : ""}</div>
 <p>${escapeHtml(r.description || "Discover this food destination with Tastify.")}</p>
-<div class="rating">★ ${Number(r.rating || 0).toFixed(1)} · ${Number(r.review_count || 0)} reviews</div>
+<div class="rating">РўЁ ${Number(r.rating || 0).toFixed(1)} ┬и ${Number(r.review_count || 0)} reviews</div>
 <div class="tags">
 ${escapeHtml(r.cuisine || "Food")}
 ${r.price_range ? `<span class="tag">${escapeHtml(r.price_range)}</span>` : ""}
@@ -2512,9 +2685,9 @@ ${r.price_range ? `<span class="tag">${escapeHtml(r.price_range)}</span>` : ""}
 <div class="cardImage">Recipe</div>
 <div class="cardBody">
 <h3>${escapeHtml(r.title)}</h3>
-<div class="meta">${escapeHtml(r.cuisine || "")} · ${escapeHtml(r.difficulty || "Easy")}</div>
+<div class="meta">${escapeHtml(r.cuisine || "")} ┬и ${escapeHtml(r.difficulty || "Easy")}</div>
 <p>${escapeHtml(r.description || "")}</p>
-<div class="rating">★ ${Number(r.rating || 0).toFixed(1)}</div>
+<div class="rating">РўЁ ${Number(r.rating || 0).toFixed(1)}</div>
 <a class="btn gold" href="/recipe/${encodeURIComponent(r.slug)}">View Recipe</a>
 </div>
 </div>`
@@ -2650,7 +2823,7 @@ style="width:100%;height:230px;object-fit:cover"
           (r) => `
 <div class="review">
 <strong>${escapeHtml(r.author_name)}</strong>
-<div class="rating">★ ${Number(r.overall_rating).toFixed(0)}/5</div>
+<div class="rating">РўЁ ${Number(r.overall_rating).toFixed(0)}/5</div>
 ${r.title ? `<h3>${escapeHtml(r.title)}</h3>` : ""}
 <p>${escapeHtml(r.body)}</p>
 <div class="meta">${escapeHtml(r.created_at || "")}</div>
@@ -2672,8 +2845,8 @@ ${escapeHtml(restaurant.cuisine || "Restaurant")}
 <h1>${escapeHtml(restaurant.name)}</h1>
 
 <div class="rating">
-★ ${Number(restaurant.rating || 0).toFixed(1)}
-· ${Number(restaurant.review_count || 0)} reviews
+РўЁ ${Number(restaurant.rating || 0).toFixed(1)}
+┬и ${Number(restaurant.review_count || 0)} reviews
 </div>
 
 <p>${escapeHtml(restaurant.description || "")}</p>
@@ -2686,8 +2859,8 @@ ${restaurant.price_range ? `<span class="tag">${escapeHtml(restaurant.price_rang
 <p>
 <strong>Location:</strong>
 ${escapeHtml(restaurant.city_name || "")}
-${restaurant.area ? " · " + escapeHtml(restaurant.area) : ""}
-${restaurant.address ? " · " + escapeHtml(restaurant.address) : ""}
+${restaurant.area ? " ┬и " + escapeHtml(restaurant.area) : ""}
+${restaurant.address ? " ┬и " + escapeHtml(restaurant.address) : ""}
 </p>
 
 ${
@@ -2841,7 +3014,7 @@ ${escapeHtml(recipe.category || "Recipe")}
 </div>
 
 <div class="rating">
-★ ${Number(recipe.rating || 0).toFixed(1)}
+РўЁ ${Number(recipe.rating || 0).toFixed(1)}
 </div>
 
 </div>
@@ -3624,7 +3797,7 @@ restaurants.map(function(r){
 return '<tr>'+
 '<td><strong>'+escapeClient(r.name)+'</strong><br><span class="meta">'+escapeClient(r.cuisine||"")+'</span></td>'+
 '<td>'+escapeClient(r.city_name||"")+'</td>'+
-'<td>★ '+Number(r.rating||0).toFixed(1)+'<br>'+Number(r.review_count||0)+' reviews</td>'+
+'<td>РўЁ '+Number(r.rating||0).toFixed(1)+'<br>'+Number(r.review_count||0)+' reviews</td>'+
 '<td>'+escapeClient(r.status)+'</td>'+
 '<td>'+
 '<button class="smallBtn" onclick="editRestaurant('+r.id+')">Edit</button>'+
@@ -3819,7 +3992,7 @@ row.innerHTML=
 '<input class="ingredientName" placeholder="Ingredient" value="'+escapeAttr(value||"")+'">'+
 '<div style="display:flex;gap:5px">'+
 '<input class="ingredientQuantity" placeholder="Quantity" value="'+escapeAttr(quantity||"")+'">'+
-'<button type="button" onclick="this.parentElement.parentElement.remove()">×</button>'+
+'<button type="button" onclick="this.parentElement.parentElement.remove()">├Ќ</button>'+
 '</div>';
 
 document.getElementById("ingredientRows").appendChild(row);
@@ -3838,7 +4011,7 @@ row.innerHTML=
 '<textarea class="stepInstruction" placeholder="Step instruction">'+
 escapeClient(value||"")+
 '</textarea>'+
-'<button type="button" onclick="this.parentElement.remove()">×</button>';
+'<button type="button" onclick="this.parentElement.remove()">├Ќ</button>';
 
 document.getElementById("stepRows").appendChild(row);
 
@@ -4194,8 +4367,8 @@ buttons+='<button class="smallBtn danger" onclick="rejectReview('+r.id+')">Rejec
 
 return '<div class="review">'+
 '<strong>'+escapeClient(r.author_name)+'</strong>'+
-'<div class="rating">★ '+escapeClient(r.overall_rating)+'/5</div>'+
-'<div class="meta">'+escapeClient(r.restaurant_name)+' · '+escapeClient(r.status)+'</div>'+
+'<div class="rating">РўЁ '+escapeClient(r.overall_rating)+'/5</div>'+
+'<div class="meta">'+escapeClient(r.restaurant_name)+' ┬и '+escapeClient(r.status)+'</div>'+
 (r.title?'<h3>'+escapeClient(r.title)+'</h3>':"")+
 '<p>'+escapeClient(r.body)+'</p>'+
 buttons+
@@ -4255,9 +4428,9 @@ alert(error.message);
 function escapeClient(value){
 
 return String(value==null?"":value)
-.replace(/&/g,"&")
-.replace(/</g,"<")
-.replace(/>/g,">")
+.replace(/&/g,"&amp;")
+.replace(/</g,"&lt;")
+.replace(/>/g,"&gt;")
 .replace(/"/g,"&quot;")
 .replace(/'/g,"&#039;");
 
@@ -4285,4 +4458,14 @@ loadStats();
     content,
     script
   );
+}
+
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }
