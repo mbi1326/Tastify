@@ -1,5 +1,4 @@
- 
-export default {
+ export default {
   async fetch(request, env) {
     try {
       const url = new URL(request.url);
@@ -4458,14 +4457,4 @@ loadStats();
     content,
     script
   );
-}
-
-
-function escapeHtml(value) {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
 }
